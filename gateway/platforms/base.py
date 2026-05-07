@@ -2770,7 +2770,8 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+                            speech_source = getattr(event, "_hermes_voice_spoken_text", None) or text_content
+                            speech_text = re.sub(r'[*_`#\[\]()]', '', speech_source)[:4000].strip()
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
                             tts_result_str = await asyncio.to_thread(

@@ -38,6 +38,7 @@ from typing import Dict, Optional, Any, List, Union
 # gateway is a long-running daemon, so its boot cost matters less than
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -5500,6 +5501,531 @@ class GatewayRunner:
             return []
         return list(pending_native.pop(session_key, []) or [])
 
+    def _voice_fast_ack_config(self) -> dict:
+        """Return the voice.fast_ack config block, or {} when absent/invalid."""
+        try:
+            cfg = _load_gateway_config()
+            voice_cfg = cfg.get("voice") if isinstance(cfg, dict) else {}
+            fast_cfg = (voice_cfg or {}).get("fast_ack") if isinstance(voice_cfg, dict) else {}
+            return fast_cfg if isinstance(fast_cfg, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _voice_fast_ack_truthy(value: Any, *, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _voice_fast_ack_enabled(self, event: MessageEvent, cfg: dict) -> bool:
+        """Gate fast-ack to explicit config and real voice/audio inputs only."""
+        if not isinstance(cfg, dict) or not self._voice_fast_ack_truthy(cfg.get("enabled")):
+            return False
+        if getattr(event, "message_type", None) not in (MessageType.VOICE, MessageType.AUDIO):
+            return False
+        try:
+            voice_key = self._voice_key(event.source.platform, event.source.chat_id)
+            if getattr(self, "_voice_mode", {}).get(voice_key) == "off":
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _voice_fast_ack_int(self, cfg: dict, key: str, default: int, *, minimum: int = 1, maximum: int = 10000) -> int:
+        try:
+            value = int(cfg.get(key) if cfg.get(key) is not None else default)
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(value, maximum))
+
+    @staticmethod
+    def _parse_voice_fast_ack_router_response(raw: str) -> dict | None:
+        """Parse strict router JSON, tolerating fenced output and coercing fields."""
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.IGNORECASE | re.DOTALL)
+        if fence:
+            text = fence.group(1).strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        def _coerce_str(value) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value.strip()
+            return str(value).strip()
+
+        raw_is_job = data.get("is_job", False)
+        if isinstance(raw_is_job, str):
+            is_job = raw_is_job.strip().lower() in {"1", "true", "yes", "y", "job"}
+        else:
+            is_job = bool(raw_is_job)
+
+        ack_text = _coerce_str(data.get("ack_text"))[:300]
+        job_prompt = _coerce_str(data.get("job_prompt"))[:8000]
+        response_mode = _coerce_str(data.get("response_mode"))[:80]
+        return {
+            "ack_text": ack_text,
+            "is_job": is_job,
+            "job_prompt": job_prompt,
+            "response_mode": response_mode,
+        }
+
+    def _build_voice_fast_ack_router_messages(self, transcript: str, cfg: dict) -> list[dict]:
+        """Build the lightweight dispatcher/narrator prompt for a voice transcript."""
+        max_ack_words = self._voice_fast_ack_int(cfg, "max_ack_words", 12, minimum=1, maximum=30)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are Hermes's voice fast-ack router. You are only a dispatcher "
+                    "and narrator. Never answer the user's request, never call tools, and "
+                    "never bypass Hermes auth, approvals, or safety. Return strict JSON only "
+                    "with exactly these keys: ack_text, is_job, job_prompt, response_mode. "
+                    f"ack_text must be a natural spoken acknowledgement of at most {max_ack_words} words. "
+                    "is_job is an advisory classification for whether the transcript contains substantial work; "
+                    "it does not bypass or skip the normal Hermes agent loop. "
+                    "job_prompt may rewrite the transcript into a clear prompt for the primary agent; "
+                    "leave it empty when the transcript is already clear. response_mode is a short string "
+                    "such as normal, direct, background, or ask_clarify."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Voice transcript:\n{transcript}",
+            },
+        ]
+
+    def _voice_fast_ack_timeout(self, cfg: dict, *, default: float = 1.5) -> float:
+        try:
+            if cfg.get("ack_timeout_ms") is not None:
+                timeout = float(cfg.get("ack_timeout_ms")) / 1000.0
+            elif cfg.get("timeout") is not None:
+                timeout = float(cfg.get("timeout"))
+            else:
+                timeout = default
+        except (TypeError, ValueError):
+            timeout = default
+        return max(0.1, min(timeout, 10.0))
+
+    def _voice_fast_ack_llm_kwargs(self, cfg: dict, messages: list[dict], *, timeout: float, max_tokens: int) -> dict:
+        kwargs = {
+            "provider": cfg.get("provider"),
+            "model": cfg.get("model"),
+            "base_url": cfg.get("base_url"),
+            "api_key": cfg.get("api_key"),
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+        }
+        if isinstance(cfg.get("extra_body"), dict):
+            kwargs["extra_body"] = dict(cfg["extra_body"])
+        return kwargs
+
+    def _voice_fast_ack_stt_failed(self, message_text: str) -> bool:
+        text = (message_text or "").strip().lower()
+        if not text:
+            return True
+        return any(marker in text for marker in (
+            "transcription failed",
+            "transcription is disabled",
+            "stt is disabled",
+            "stt failed",
+            "speech-to-text failed",
+            "could not transcribe",
+            "can't transcribe",
+            "can’t transcribe",
+            "can't listen",
+            "can’t listen",
+            "unable to transcribe",
+            "audio transcription failed",
+            "no stt provider",
+            "speech-to-text provider",
+            "voice_tools_openai_key",
+        ))
+
+    async def _maybe_prepare_voice_fast_ack(self, event, message_text: str, source) -> tuple[str, dict | None]:
+        """Optionally fast-ack a voice transcript and rewrite it for the normal agent path.
+
+        This helper fails open: any invalid JSON, timeout, API error, or TTS/send
+        failure leaves the original message_text intact and lets _run_agent handle it.
+        """
+        cfg = self._voice_fast_ack_config()
+        if not self._voice_fast_ack_enabled(event, cfg):
+            return message_text, None
+        if self._voice_fast_ack_stt_failed(message_text):
+            return message_text, None
+
+        messages = self._build_voice_fast_ack_router_messages(message_text, cfg)
+        timeout = self._voice_fast_ack_timeout(cfg)
+        max_tokens = self._voice_fast_ack_int(cfg, "max_tokens", 160, minimum=16, maximum=1000)
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    call_llm,
+                    **self._voice_fast_ack_llm_kwargs(
+                        cfg,
+                        messages,
+                        timeout=timeout,
+                        max_tokens=max_tokens,
+                    ),
+                ),
+                timeout=timeout + 0.25,
+            )
+            raw = extract_content_or_reasoning(response)
+            route = self._parse_voice_fast_ack_router_response(raw)
+        except Exception as exc:
+            logger.debug("voice fast-ack router failed open: %s", exc)
+            return message_text, None
+
+        if not route:
+            return message_text, None
+
+        ack_text = route.get("ack_text") or ""
+        if ack_text:
+            try:
+                tts_timeout = self._voice_fast_ack_timeout(cfg, default=3.0)
+                sent = await asyncio.wait_for(
+                    self._send_voice_reply(event, ack_text),
+                    timeout=tts_timeout + 0.25,
+                )
+                if sent is False:
+                    raise RuntimeError("_send_voice_reply returned false")
+            except Exception as exc:
+                logger.debug("voice fast-ack TTS failed; falling back to text ack: %s", exc)
+                try:
+                    adapter = self.adapters.get(getattr(source, "platform", None))
+                    if adapter and getattr(source, "chat_id", None):
+                        await adapter.send(
+                            source.chat_id,
+                            ack_text,
+                            metadata=self._thread_metadata_for_source(source),
+                        )
+                except Exception:
+                    logger.debug("voice fast-ack text fallback failed", exc_info=True)
+
+        job_prompt = route.get("job_prompt") or ""
+        if job_prompt:
+            prepared = (
+                "[Voice router suggested a clearer prompt for the primary agent. "
+                "This suggestion is advisory only; the original voice transcript below is authoritative.\n"
+                f"Suggested prompt: {job_prompt}]\n\n"
+                f"Original voice transcript:\n{message_text}"
+            )
+            return prepared, route
+        return message_text, route
+
+    def _voice_fast_speech_config(self, cfg: dict | None = None) -> dict:
+        """Return the nested filtered-thought speech config from voice.fast_ack."""
+        base = cfg if isinstance(cfg, dict) else self._voice_fast_ack_config()
+        raw = base.get("filtered_thought_fast_speech")
+        if raw is None:
+            raw = base.get("filtered_thought_speech")
+        if raw is None:
+            raw = base.get("progress_speech")
+        if raw is True:
+            return {"enabled": True}
+        return raw if isinstance(raw, dict) else {}
+
+    def _voice_fast_speech_enabled(self, event: MessageEvent, cfg: dict | None = None) -> bool:
+        base = cfg if isinstance(cfg, dict) else self._voice_fast_ack_config()
+        if not self._voice_fast_ack_enabled(event, base):
+            return False
+        speech_cfg = self._voice_fast_speech_config(base)
+        return self._voice_fast_ack_truthy(speech_cfg.get("enabled"))
+
+    @staticmethod
+    def _parse_voice_fast_speech_response(raw: str) -> dict | None:
+        """Parse strict filtered-progress speech JSON."""
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.IGNORECASE | re.DOTALL)
+        if fence:
+            text = fence.group(1).strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        raw_should = data.get("should_speak", True)
+        if isinstance(raw_should, str):
+            should_speak = raw_should.strip().lower() in {"1", "true", "yes", "y", "speak"}
+        else:
+            should_speak = bool(raw_should)
+        speech_text = data.get("speech_text", "")
+        if speech_text is None:
+            speech_text = ""
+        speech_text = str(speech_text).strip()[:500]
+        return {"should_speak": should_speak, "speech_text": speech_text}
+
+    @staticmethod
+    def _sanitize_voice_fast_speech_text(text: str, *, max_words: int = 18) -> str | None:
+        """Post-filter Spark progress narration before it can reach TTS."""
+        speech = str(text or "").strip()
+        if not speech:
+            return None
+        lower = speech.lower()
+        forbidden_markers = (
+            "chain of thought",
+            "chain-of-thought",
+            "hidden reasoning",
+            "private reasoning",
+            "raw prompt",
+            "system prompt",
+            "api key",
+            "password",
+            "secret",
+            "access token",
+            "bearer token",
+            "tool output",
+            "file contents",
+        )
+        if any(marker in lower for marker in forbidden_markers):
+            return None
+        secretish_patterns = (
+            r"\bsk-[A-Za-z0-9_-]{8,}\b",
+            r"\b[A-Za-z0-9_]{20,}\.[A-Za-z0-9_]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            r"https?://\S+",
+            r"(?:^|\s)/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+",
+            r"[A-Za-z]:\\[^\s]+",
+            r"(?:^|\s)~?/\S+",
+            r"(?:^|\s)\.\.?/\S+",
+            r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+\b",
+        )
+        if any(re.search(pattern, speech) for pattern in secretish_patterns):
+            return None
+        speech = re.sub(r"```.*?```", "", speech, flags=re.DOTALL).strip()
+        words = speech.split()
+        if len(words) > max_words:
+            speech = " ".join(words[:max_words]).rstrip(",.;:") + "..."
+        return speech or None
+
+    @staticmethod
+    def _voice_fast_speech_safe_tool_name(tool_name: str) -> str:
+        raw = str(tool_name or "")
+        lower = raw.lower()
+        known_tools = (
+            "search_files", "read_file", "write_file", "execute_code", "terminal",
+            "browser", "web_search", "web_extract", "delegate_task", "patch", "process",
+        )
+        for known in known_tools:
+            if known in lower:
+                return known
+        if re.search(r"sk-[A-Za-z0-9_-]{4,}|/|\\|https?://|secret|token|password", raw, re.IGNORECASE):
+            return "tool"
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "", raw)[:60]
+        return safe_name or "tool"
+
+    @staticmethod
+    def _voice_fast_speech_tool_activity(tool_name: str, event_type: str, *, is_error: bool = False) -> str:
+        safe_name = GatewayRunner._voice_fast_speech_safe_tool_name(tool_name)
+        family = safe_name.lower()
+        if is_error:
+            return f"{safe_name} hit an error"
+        if family in {"read_file", "write_file", "patch"} or "file" in family:
+            activity = "working with local files"
+        elif family in {"search_files"} or "search" in family and "web" not in family:
+            activity = "searching the local workspace"
+        elif family in {"terminal", "execute_code", "process"}:
+            activity = "running a local command"
+        elif "browser" in family:
+            activity = "checking a page in the browser"
+        elif "web" in family:
+            activity = "checking web results"
+        elif "delegate" in family or "subagent" in family:
+            activity = "checking with a specialist worker"
+        else:
+            activity = f"using {safe_name}"
+        if event_type == "tool.completed":
+            return f"finished {activity}"
+        return activity
+
+    def _voice_fast_speech_event_lines(self, events: list[dict], cfg: dict) -> list[str]:
+        speech_cfg = self._voice_fast_speech_config(cfg)
+        max_events = self._voice_fast_ack_int(speech_cfg, "max_events_per_update", 8, minimum=1, maximum=30)
+        lines: list[str] = []
+        for item in list(events or [])[-max_events:]:
+            if not isinstance(item, dict):
+                continue
+            event_type = str(item.get("event_type") or "").strip()
+            if event_type not in {"tool.started", "tool.completed"}:
+                continue
+            tool_name = str(item.get("tool_name") or "").strip()
+            safe_tool_name = self._voice_fast_speech_safe_tool_name(tool_name)
+            lines.append(
+                f"{event_type}: {safe_tool_name} — "
+                f"{self._voice_fast_speech_tool_activity(tool_name, event_type, is_error=bool(item.get('is_error')))}"
+            )
+        return lines
+
+    def _build_voice_fast_speech_messages(self, events: list[dict], cfg: dict) -> list[dict]:
+        """Build Spark prompt for safe filtered thought fast speech updates."""
+        speech_cfg = self._voice_fast_speech_config(cfg)
+        max_words = self._voice_fast_ack_int(speech_cfg, "max_words", 18, minimum=4, maximum=60)
+        emotion = str(speech_cfg.get("emotion") or speech_cfg.get("style") or "focused, warm").strip()[:120]
+        lines = self._voice_fast_speech_event_lines(events, cfg)
+        transcript = "\n".join(f"- {line}" for line in lines) or "- no useful activity yet"
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are Spark, Hermes's filtered thought fast speech narrator. "
+                    "Turn observable tool activity into one short spoken progress update for voice TTS. "
+                    "Return strict JSON only with exactly these keys: should_speak, speech_text. "
+                    "Do not reveal private chain-of-thought, hidden reasoning, raw prompts, secrets, file contents, "
+                    "or tool outputs. Do not claim completion. Summarize only safe, observable activity and high-level intent. "
+                    f"Keep speech_text under {max_words} words. If the update is too trivial or duplicative, set should_speak false. "
+                    f"Use this emotional direction lightly if helpful, including ElevenLabs-style bracket tags only when natural: {emotion}."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Tool/activity transcript for filtered thought fast speech:\n" + transcript,
+            },
+        ]
+
+    async def _maybe_send_voice_fast_speech_update(self, event: MessageEvent, events: list[dict]) -> str | None:
+        """Generate and speak one filtered progress update from recent tool activity."""
+        cfg = self._voice_fast_ack_config()
+        if not self._voice_fast_speech_enabled(event, cfg):
+            return None
+        if not events:
+            return None
+        speech_cfg = self._voice_fast_speech_config(cfg)
+        merged_cfg = {**cfg, **speech_cfg}
+        timeout = self._voice_fast_ack_timeout(merged_cfg)
+        max_tokens = self._voice_fast_ack_int(merged_cfg, "max_tokens", 120, minimum=16, maximum=1000)
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    call_llm,
+                    **self._voice_fast_ack_llm_kwargs(
+                        merged_cfg,
+                        self._build_voice_fast_speech_messages(events, cfg),
+                        timeout=timeout,
+                        max_tokens=max_tokens,
+                    ),
+                ),
+                timeout=timeout + 0.25,
+            )
+            parsed = self._parse_voice_fast_speech_response(extract_content_or_reasoning(response))
+        except Exception as exc:
+            logger.debug("voice filtered-thought speech failed open: %s", exc)
+            return None
+        if not parsed or not parsed.get("should_speak"):
+            return None
+        speech_text = self._sanitize_voice_fast_speech_text(
+            parsed.get("speech_text") or "",
+            max_words=self._voice_fast_ack_int(speech_cfg, "max_words", 18, minimum=4, maximum=60),
+        )
+        if not speech_text:
+            return None
+        try:
+            sent = await asyncio.wait_for(
+                self._send_voice_reply(event, speech_text),
+                timeout=self._voice_fast_ack_timeout(merged_cfg, default=3.0) + 0.25,
+            )
+            if sent is False:
+                return None
+        except Exception as exc:
+            logger.debug("voice filtered-thought speech TTS failed open: %s", exc)
+            return None
+        return speech_text
+
+    def _voice_final_summary_needed(self, response: str, route: dict | None = None) -> bool:
+        mode = str((route or {}).get("response_mode") or "").strip().lower()
+        if mode in {"summary", "spoken_summary", "summarize", "background"}:
+            return True
+        text = response or ""
+        if len(text) >= 500:
+            return True
+        markdown_markers = len(re.findall(r"(^\s{0,3}#{1,6}\s|```|\[[^\]]+\]\(|[*_`]|^\s*[-*+]\s+)", text, re.MULTILINE))
+        return markdown_markers >= 3
+
+    def _build_voice_final_summary_messages(self, response: str, cfg: dict) -> list[dict]:
+        seconds = self._voice_fast_ack_int(
+            cfg,
+            "max_spoken_summary_seconds",
+            20,
+            minimum=3,
+            maximum=60,
+        )
+        word_budget = max(20, min(120, seconds * 3))
+        clipped = response[:12000]
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Create a concise, natural spoken summary for voice TTS. "
+                    "Preserve the meaning, omit markdown formatting, avoid code blocks and URLs unless essential, "
+                    f"and keep it under about {word_budget} words. Return only the spoken text."
+                ),
+            },
+            {"role": "user", "content": clipped},
+        ]
+
+    async def _maybe_prepare_voice_final_summary(self, event, response: str, route: dict | None = None) -> str:
+        """Set event._hermes_voice_spoken_text for voice TTS while returning response unchanged."""
+        cfg = self._voice_fast_ack_config()
+        if not self._voice_fast_ack_enabled(event, cfg):
+            return response
+        if not self._voice_fast_ack_truthy(cfg.get("summarize_final")) or not response:
+            return response
+        if not self._voice_final_summary_needed(response, route):
+            return response
+
+        timeout = self._voice_fast_ack_timeout(cfg, default=2.0)
+        max_tokens = self._voice_fast_ack_int(
+            cfg,
+            "summary_max_tokens" if cfg.get("summary_max_tokens") is not None else "max_tokens",
+            180,
+            minimum=16,
+            maximum=1000,
+        )
+        messages = self._build_voice_final_summary_messages(response, cfg)
+        try:
+            llm_response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    call_llm,
+                    **self._voice_fast_ack_llm_kwargs(
+                        cfg,
+                        messages,
+                        timeout=timeout,
+                        max_tokens=max_tokens,
+                    ),
+                ),
+                timeout=timeout + 0.25,
+            )
+            summary = (extract_content_or_reasoning(llm_response) or "").strip()
+        except Exception as exc:
+            logger.debug("voice final summary failed open: %s", exc)
+            return response
+
+        if summary:
+            setattr(event, "_hermes_voice_spoken_text", summary[:2000])
+        return response
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -6034,6 +6560,12 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        message_text, _voice_fast_ack_route = await self._maybe_prepare_voice_fast_ack(
+            event,
+            message_text,
+            source,
+        )
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -6064,6 +6596,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -6394,10 +6927,18 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            # Final voice summary: keep the full text response, but give base
+            # adapter auto-TTS a concise spoken version when configured.
+            response = await self._maybe_prepare_voice_final_summary(
+                event,
+                response,
+                _voice_fast_ack_route,
+            )
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
-                await self._send_voice_reply(event, response)
+                await self._send_voice_reply(event, self._voice_reply_tts_text(event, response))
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -8119,6 +8660,13 @@ class GatewayRunner:
 
         await adapter.handle_message(event)
 
+    def _voice_reply_tts_text(self, event: MessageEvent, response: str) -> str:
+        """Return the text that should be spoken for runner-side voice replies."""
+        spoken = getattr(event, "_hermes_voice_spoken_text", None)
+        if isinstance(spoken, str) and spoken.strip():
+            return spoken.strip()
+        return response
+
     def _should_send_voice_reply(
         self,
         event: MessageEvent,
@@ -8173,8 +8721,12 @@ class GatewayRunner:
 
         return True
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply."""
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
+        """Generate TTS audio and send as a voice message before the text reply.
+
+        Returns True when audio was handed to an adapter, False otherwise. Existing
+        callers may ignore the return value.
+        """
         import uuid as _uuid
         audio_path = None
         actual_path = None
@@ -8183,7 +8735,7 @@ class GatewayRunner:
 
             tts_text = _strip_markdown_for_tts(text[:4000])
             if not tts_text:
-                return
+                return False
 
             # Use .mp3 extension so edge-tts conversion to opus works correctly.
             # The TTS tool may convert to .ogg — use file_path from result.
@@ -8202,7 +8754,7 @@ class GatewayRunner:
             actual_path = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual_path):
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
 
             adapter = self.adapters.get(event.source.platform)
 
@@ -8213,6 +8765,7 @@ class GatewayRunner:
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
                 await adapter.play_in_voice_channel(guild_id, actual_path)
+                return True
             elif adapter and hasattr(adapter, "send_voice"):
                 send_kwargs: Dict[str, Any] = {
                     "chat_id": event.source.chat_id,
@@ -8222,8 +8775,11 @@ class GatewayRunner:
                 if event.source.thread_id:
                     send_kwargs["metadata"] = {"thread_id": event.source.thread_id}
                 await adapter.send_voice(**send_kwargs)
+                return True
+            return False
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in {audio_path, actual_path} - {None}:
                 try:
@@ -11608,6 +12164,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -11707,6 +12264,13 @@ class GatewayRunner:
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
+        _voice_speech_event = event
+        _voice_speech_cfg = self._voice_fast_ack_config()
+        voice_fast_speech_enabled = bool(
+            _voice_speech_event is not None
+            and self._voice_fast_speech_enabled(_voice_speech_event, _voice_speech_cfg)
+        )
+        fast_speech_queue = queue.Queue(maxsize=50) if voice_fast_speech_enabled else None
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -11717,7 +12281,22 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if not _run_still_current():
+                return
+
+            if fast_speech_queue and event_type in ("tool.started", "tool.completed"):
+                try:
+                    fast_speech_queue.put_nowait({
+                        "event_type": event_type,
+                        "tool_name": tool_name,
+                        "is_error": kwargs.get("is_error"),
+                    })
+                except queue.Full:
+                    pass
+                except Exception as _speech_q_err:
+                    logger.debug("voice filtered-thought speech queue error: %s", _speech_q_err)
+
+            if not progress_queue:
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -12018,6 +12597,77 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
+
+        async def send_voice_fast_speech_updates():
+            """Speak concise Spark-generated progress narration from tool activity."""
+            if not fast_speech_queue or _voice_speech_event is None:
+                return
+            speech_cfg = self._voice_fast_speech_config(_voice_speech_cfg)
+            try:
+                min_interval = float(speech_cfg.get("min_interval_seconds", 10))
+            except (TypeError, ValueError):
+                min_interval = 10.0
+            min_interval = max(1.0, min(min_interval, 120.0))
+            max_updates = self._voice_fast_ack_int(speech_cfg, "max_updates_per_turn", 3, minimum=1, maximum=20)
+            max_pending = self._voice_fast_ack_int(speech_cfg, "max_events_per_update", 8, minimum=1, maximum=30)
+            try:
+                debounce = float(speech_cfg.get("debounce_seconds", 0.75))
+            except (TypeError, ValueError):
+                debounce = 0.75
+            debounce = max(0.1, min(debounce, 5.0))
+            spoken_count = 0
+            last_spoken_at = 0.0
+            pending_events: list[dict] = []
+
+            while True:
+                try:
+                    if not _run_still_current():
+                        while not fast_speech_queue.empty():
+                            try:
+                                fast_speech_queue.get_nowait()
+                            except Exception:
+                                break
+                        return
+                    if spoken_count >= max_updates:
+                        while not fast_speech_queue.empty():
+                            try:
+                                fast_speech_queue.get_nowait()
+                            except Exception:
+                                break
+                        return
+                    raw = fast_speech_queue.get_nowait()
+                    if isinstance(raw, dict):
+                        pending_events.append(raw)
+                        pending_events = pending_events[-max_pending:]
+                    now = time.monotonic()
+                    if spoken_count > 0 and (now - last_spoken_at) < min_interval:
+                        await asyncio.sleep(min(0.25, min_interval - (now - last_spoken_at)))
+                        continue
+                    await asyncio.sleep(debounce)
+                    while not fast_speech_queue.empty():
+                        try:
+                            more = fast_speech_queue.get_nowait()
+                            if isinstance(more, dict):
+                                pending_events.append(more)
+                                pending_events = pending_events[-max_pending:]
+                        except Exception:
+                            break
+                    events_for_update = pending_events
+                    pending_events = []
+                    spoken = await self._maybe_send_voice_fast_speech_update(
+                        _voice_speech_event,
+                        events_for_update,
+                    )
+                    if spoken:
+                        spoken_count += 1
+                        last_spoken_at = time.monotonic()
+                except queue.Empty:
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.debug("voice filtered-thought speech task error: %s", e)
+                    await asyncio.sleep(1)
         
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
@@ -12312,7 +12962,7 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = progress_callback if (tool_progress_enabled or voice_fast_speech_enabled) else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -12801,6 +13451,10 @@ class GatewayRunner:
         progress_task = None
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
+
+        fast_speech_task = None
+        if voice_fast_speech_enabled:
+            fast_speech_task = asyncio.create_task(send_voice_fast_speech_updates())
 
         # Start stream consumer task — polls for consumer creation since it
         # happens inside run_sync (thread pool) after the agent is constructed.
@@ -13330,11 +13984,14 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    event=pending_event,
                 )
         finally:
-            # Stop progress sender, interrupt monitor, and notification task
+            # Stop progress sender, voice fast-speech sender, interrupt monitor, and notification task
             if progress_task:
                 progress_task.cancel()
+            if fast_speech_task:
+                fast_speech_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
 
@@ -13364,7 +14021,7 @@ class GatewayRunner:
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [progress_task, fast_speech_task, interrupt_monitor, tracking_task, _notify_task]:
                 if task:
                     try:
                         await task
