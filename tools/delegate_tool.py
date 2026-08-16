@@ -55,6 +55,12 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
     ]
 )
 
+# Additional exact-name denies for engine-owned read-only agentic_map workers.
+# This is an internal capability bit, never a model-facing delegate_task field.
+READ_ONLY_BLOCKED_TOOLS = frozenset(
+    {"terminal", "write_file", "patch", "execute_code"}
+)
+
 
 # ---------------------------------------------------------------------------
 # Subagent approval callbacks
@@ -1214,6 +1220,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    read_only: bool = False,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1307,6 +1314,10 @@ def _build_child_agent(
             inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
         )
     )
+    if read_only:
+        child_disabled_toolsets = list(
+            dict.fromkeys(child_disabled_toolsets + sorted(READ_ONLY_BLOCKED_TOOLS))
+        )
 
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
@@ -2080,6 +2091,10 @@ def _run_single_child(
                 pass
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    # Set once the child worker is submitted. The outer finally block uses it
+    # to avoid tearing down a timed-out child while run_conversation is still
+    # unwinding on the daemon worker.
+    _child_future = None
 
     # Register the live agent in the module-level registry so the TUI can
     # target it by subagent_id (kill, pause, status queries).  Unregistered
@@ -2582,14 +2597,22 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        # Close tool resources only after the worker has stopped using them.
+        # A hard delegation timeout returns before blocking I/O necessarily
+        # reacts to the interrupt. Closing the child immediately used to clear
+        # its context engine underneath the still-running conversation loop,
+        # producing context_compressor=None crashes and premature DB teardown.
+        def _close_child_after_worker(_future=None):
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
+
+        if _child_future is not None and not _child_future.done():
+            _child_future.add_done_callback(_close_child_after_worker)
+        else:
+            _close_child_after_worker()
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop
@@ -2783,6 +2806,9 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    delegated_scope: Optional[str] = None,
+    kept_work: Optional[str] = None,
+    read_only: bool = False,
     parent_agent=None,
 ) -> str:
     """
@@ -2823,19 +2849,31 @@ def delegate_task(
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
 
-    # Depth limit — configurable via delegation.max_spawn_depth,
-    # default 2 for parity with the original MAX_DEPTH constant.
     depth = getattr(parent_agent, "_delegate_depth", 0)
     max_spawn = _get_max_spawn_depth()
     if depth >= max_spawn:
         return tool_error(
             f"Delegation depth limit reached (depth={depth}, "
-            f"max_spawn_depth={max_spawn}). Raise "
-            f"delegation.max_spawn_depth in config.yaml if deeper "
-            f"nesting is required (no hard ceiling, but each level "
-            f"multiplies API cost)."
+            f"max_spawn_depth={max_spawn}); the operator cap forbids another child."
         )
 
+    # Nested single-child delegation must be a strict reduction in the
+    # caller's responsibility. Parallel sibling decomposition is exempt: it
+    # does not form a pass-through recursion chain.
+    if depth > 0 and not tasks:
+        delegated = str(delegated_scope or "").strip()
+        retained = str(kept_work or "").strip()
+        if not delegated or not retained:
+            return tool_error(
+                "Nested delegation requires both delegated_scope (the bounded slice handed off) "
+                "and kept_work (the concrete work the caller will perform itself)."
+            )
+        if delegated.casefold() == retained.casefold():
+            return tool_error("delegated_scope and kept_work must describe distinct responsibilities.")
+
+    # Retain the operator-configured cap as defense in depth. Termination does
+    # not depend on it: every nested single delegation has already satisfied
+    # the scope-reduction invariant above.
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
@@ -2961,6 +2999,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            read_only=bool(read_only),
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3802,6 +3841,18 @@ DELEGATE_TASK_SCHEMA = {
                     "Background information the subagent needs: file paths, "
                     "error messages, project structure, constraints. The more "
                     "specific you are, the better the subagent performs."
+                ),
+            },
+            "delegated_scope": {
+                "type": "string",
+                "description": (
+                    "Required for nested single-task delegation: the specific, strictly smaller slice handed to the child."
+                ),
+            },
+            "kept_work": {
+                "type": "string",
+                "description": (
+                    "Required for nested single-task delegation: concrete work the calling subagent retains and will perform itself."
                 ),
             },
             "tasks": {

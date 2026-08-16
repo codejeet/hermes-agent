@@ -109,6 +109,62 @@ class TestTranscriptWritePatience:
         db.append_message(session_id="s2", role="user", content="fast")
         assert time.monotonic() - t0 < 5.0  # loose: no patience-length stall
 
+    def test_recovered_lock_wait_reports_operation_and_duration(
+        self, db, monkeypatch, caplog
+    ):
+        db.create_session("s-telemetry", "cli")
+        monkeypatch.setattr(SessionDB, "_WRITE_WAIT_WARN_AFTER_S", 0.01)
+
+        started = threading.Event()
+        holder = threading.Thread(
+            target=_hold_write_lock, args=(db.db_path, 0.15, started)
+        )
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            with caplog.at_level("WARNING", logger="hermes_state"):
+                db.append_message(
+                    session_id="s-telemetry", role="user", content="logged wait"
+                )
+        finally:
+            holder.join(timeout=2.0)
+
+        assert not holder.is_alive()
+        record = next(
+            record
+            for record in caplog.records
+            if "state.db write lock wait recovered" in record.getMessage()
+        )
+        message = record.getMessage()
+        assert "append_message" in message
+        assert "elapsed=" in message
+        assert str(db.db_path) in message
+
+    def test_slow_transaction_reports_execution_separately(
+        self, db, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(SessionDB, "_WRITE_TXN_WARN_AFTER_S", 0.01)
+
+        def slow_write(conn):
+            time.sleep(0.03)
+            conn.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("slow-write-telemetry", "1"),
+            )
+
+        with caplog.at_level("WARNING", logger="hermes_state"):
+            db._execute_write(slow_write)
+
+        record = next(
+            record
+            for record in caplog.records
+            if "state.db write transaction slow" in record.getMessage()
+        )
+        message = record.getMessage()
+        assert "slow_write" in message
+        assert "lock_wait=" in message
+        assert str(db.db_path) in message
+
 
 class TestOpenLockPatience:
     def test_open_survives_multi_second_lock_hold(self, tmp_path):

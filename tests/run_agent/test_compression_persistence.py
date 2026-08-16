@@ -17,6 +17,7 @@ Bug scenario (pre-fix):
 """
 
 import os
+import copy
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -128,6 +129,42 @@ class TestFlushAfterCompression:
             rows = db.get_messages("new-session")
             assert len(rows) == 2
             assert [row["content"] for row in rows] == ["summary", "continuing..."]
+
+    def test_deep_copied_gateway_history_is_not_reappended(self):
+        """A compression copy must retain durable gateway row provenance.
+
+        LCM and other context engines may return deep-copied history even when
+        they make no material progress. Object identity then differs from the
+        caller-supplied ``conversation_history``; durable ``_row_id`` values
+        are the proof that the copied prefix already exists in state.db.
+        """
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent._ensure_db_session()
+            db.append_messages_batch(
+                session_id="original-session",
+                messages=[
+                    {"role": "user", "content": "old question"},
+                    {"role": "assistant", "content": "old answer"},
+                ],
+            )
+            history = db.get_messages_as_conversation(
+                "original-session", include_row_ids=True
+            )
+            copied = copy.deepcopy(history)
+            copied.append({"role": "user", "content": "new question"})
+
+            agent._flush_messages_to_session_db(copied, history)
+
+            rows = db.get_messages("original-session")
+            assert [row["content"] for row in rows] == [
+                "old question",
+                "old answer",
+                "new question",
+            ]
 
     def test_in_place_compression_rebaseline_prevents_duplicate_compacted_rows(self):
         """In-place compaction already persisted the compacted transcript.

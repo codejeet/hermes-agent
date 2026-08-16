@@ -785,6 +785,7 @@ _REPLAY_BUDGET_KEYS = (
     "reasoning_content",
     "codex_reasoning_items",
     "codex_message_items",
+    "codex_compaction_items",
 )
 
 

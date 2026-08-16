@@ -32,6 +32,7 @@ loop detection, which is a different concern.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -55,6 +56,19 @@ _MAX_PATHS_PER_AGENT = 4096
 # Global last-writer map cap.  Same policy.
 _MAX_GLOBAL_WRITERS = 4096
 
+# A sibling that dies or wedges while holding a path lock must not block every
+# later edit to that file forever.  Thirty seconds is deliberately much longer
+# than a normal read/modify/write critical section (typically milliseconds),
+# while still short enough to fail before the gateway's stall watchdog fires.
+_PATH_LOCK_TIMEOUT_S = 30.0
+_PATH_LOCK_WARN_AFTER_S = 1.0
+
+logger = logging.getLogger(__name__)
+
+
+class FileStateLockTimeout(TimeoutError):
+    """Raised when a file mutation cannot acquire its serialization lock."""
+
 
 class FileStateRegistry:
     """Process-wide coordinator for cross-agent file edits."""
@@ -63,6 +77,7 @@ class FileStateRegistry:
         self._reads: Dict[str, Dict[str, ReadStamp]] = defaultdict(dict)
         self._last_writer: Dict[str, Tuple[str, float]] = {}
         self._path_locks: Dict[str, threading.Lock] = {}
+        self._path_lock_owners: Dict[str, Tuple[str, int, float]] = {}
         self._meta_lock = threading.Lock()  # guards _path_locks
         self._state_lock = threading.Lock()  # guards _reads + _last_writer
 
@@ -76,17 +91,61 @@ class FileStateRegistry:
             return lock
 
     @contextmanager
-    def lock_path(self, resolved: str):
+    def lock_path(
+        self,
+        resolved: str,
+        *,
+        owner: Optional[str] = None,
+        timeout_s: float = _PATH_LOCK_TIMEOUT_S,
+    ):
         """Acquire the per-path lock for a read→modify→write section.
 
         Same process, same filesystem — threads on the same path serialize.
-        Different paths proceed in parallel.
+        Different paths proceed in parallel.  Acquisition is bounded so a
+        dead or wedged holder cannot silently stall the session forever.
         """
         lock = self._lock_for(resolved)
-        lock.acquire()
+        waiter = owner or f"thread:{threading.get_ident()}"
+        started = time.monotonic()
+        acquired = lock.acquire(timeout=max(0.0, float(timeout_s)))
+        waited = time.monotonic() - started
+        if not acquired:
+            with self._meta_lock:
+                holder = self._path_lock_owners.get(resolved)
+            holder_desc = holder[0] if holder else "unknown"
+            logger.error(
+                "File-state lock timed out after %.3fs: path=%s waiter=%s holder=%s",
+                waited,
+                resolved,
+                waiter,
+                holder_desc,
+            )
+            raise FileStateLockTimeout(
+                f"Timed out after {waited:.1f}s waiting to edit {resolved}; "
+                f"another Hermes task ({holder_desc}) still holds the file lock. "
+                "Re-read the file and retry after the other task finishes."
+            )
+
+        if waited >= _PATH_LOCK_WARN_AFTER_S:
+            logger.warning(
+                "File-state lock wait recovered after %.3fs: path=%s waiter=%s",
+                waited,
+                resolved,
+                waiter,
+            )
+        with self._meta_lock:
+            self._path_lock_owners[resolved] = (
+                waiter,
+                threading.get_ident(),
+                time.monotonic(),
+            )
         try:
             yield
         finally:
+            with self._meta_lock:
+                current = self._path_lock_owners.get(resolved)
+                if current and current[1] == threading.get_ident():
+                    self._path_lock_owners.pop(resolved, None)
             lock.release()
 
     # ── Read/write accounting ───────────────────────────────────────
@@ -256,6 +315,7 @@ class FileStateRegistry:
             self._last_writer.clear()
         with self._meta_lock:
             self._path_locks.clear()
+            self._path_lock_owners.clear()
 
 
 # ── Module-level singleton + helpers ─────────────────────────────────
@@ -304,8 +364,15 @@ def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
     return _registry.check_stale(task_id, str(resolved_or_path))
 
 
-def lock_path(resolved_or_path: str | Path):
-    return _registry.lock_path(str(resolved_or_path))
+def lock_path(
+    resolved_or_path: str | Path,
+    *,
+    owner: Optional[str] = None,
+    timeout_s: float = _PATH_LOCK_TIMEOUT_S,
+):
+    return _registry.lock_path(
+        str(resolved_or_path), owner=owner, timeout_s=timeout_s
+    )
 
 
 def writes_since(
@@ -322,6 +389,7 @@ def known_reads(task_id: str) -> List[str]:
 
 __all__ = [
     "FileStateRegistry",
+    "FileStateLockTimeout",
     "get_registry",
     "record_read",
     "note_write",

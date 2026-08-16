@@ -7,6 +7,7 @@ streaming, or the _run_codex_stream() call path.
 
 import hashlib
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -386,6 +387,24 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs["include"] = (
                     ["reasoning.encrypted_content"] if replay_encrypted_reasoning else []
                 )
+                # GPT-5.6 on the first-party Codex Responses backend supports
+                # provider-native continuity.  Retain encrypted reasoning
+                # across every turn and ask the service to emit an opaque
+                # compaction capsule before the local LCM soft threshold.
+                if is_codex_backend and "gpt-5.6" in (model or "").lower():
+                    kwargs["reasoning"]["context"] = "all_turns"
+                    raw_threshold = os.getenv(
+                        "HERMES_CODEX_NATIVE_COMPACTION_THRESHOLD", "175000"
+                    )
+                    try:
+                        native_threshold = int(raw_threshold)
+                    except (TypeError, ValueError):
+                        native_threshold = 175000
+                    native_threshold = max(32_000, native_threshold)
+                    kwargs["context_management"] = [{
+                        "type": "compaction",
+                        "compact_threshold": native_threshold,
+                    }]
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
@@ -529,6 +548,8 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_reasoning_items"] = msg.codex_reasoning_items
         if msg and hasattr(msg, "codex_message_items") and msg.codex_message_items:
             provider_data["codex_message_items"] = msg.codex_message_items
+        if msg and hasattr(msg, "codex_compaction_items") and msg.codex_compaction_items:
+            provider_data["codex_compaction_items"] = msg.codex_compaction_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
 

@@ -249,6 +249,32 @@ class TestStripBlockedTools(unittest.TestCase):
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
 
+    def test_read_only_child_denies_all_mutating_local_tools(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["hermes-cli"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect without writes",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+                read_only=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertTrue(
+            {"terminal", "write_file", "patch", "execute_code"}.issubset(
+                set(kwargs["disabled_toolsets"])
+            )
+        )
+
 
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):
@@ -261,6 +287,23 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(goal="test", parent_agent=parent))
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
+
+    def test_nested_single_delegation_requires_scope_reduction(self):
+        parent = _make_mock_parent(depth=1)
+        with patch("tools.delegate_tool._get_max_spawn_depth", return_value=2):
+            result = json.loads(delegate_task(goal="pass through everything", parent_agent=parent))
+        self.assertIn("error", result)
+        self.assertIn("delegated_scope", result["error"])
+        self.assertIn("kept_work", result["error"])
+
+    def test_parallel_nested_delegation_is_scope_guard_exempt(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("delegated_scope", props)
+        self.assertIn("kept_work", props)
+
+    def test_read_only_is_internal_not_model_facing(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("read_only", props)
 
 
     def test_child_inherits_runtime_credentials(self):
@@ -1422,7 +1465,13 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = _make_role_mock_child()
             MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
+            delegate_task(
+                goal="test",
+                role="orchestrator",
+                delegated_scope="verify the child boundary",
+                kept_work="review the child result",
+                parent_agent=parent,
+            )
             kwargs = MockAgent.call_args[1]
             self.assertIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "orchestrator")
@@ -1444,7 +1493,13 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = _make_role_mock_child()
             MockAgent.return_value = mock_child
-            delegate_task(goal="test", role="orchestrator", parent_agent=parent)
+            delegate_task(
+                goal="test",
+                role="orchestrator",
+                delegated_scope="verify the child boundary",
+                kept_work="review the child result",
+                parent_agent=parent,
+            )
             kwargs = MockAgent.call_args[1]
             self.assertNotIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "leaf")

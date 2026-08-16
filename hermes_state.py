@@ -58,6 +58,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active_by_id,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_RUNTIME_QUARANTINE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
@@ -1420,6 +1421,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                     # Table absent (FTS disabled / trigram off / cjk not
                     # present or tokenizer unavailable) — skip it.
                     continue
+            conn.execute(
+                "DELETE FROM state_meta WHERE key = ?",
+                (FTS_RUNTIME_QUARANTINE_KEY,),
+            )
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
@@ -1493,6 +1498,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.execute("PRAGMA writable_schema=ON")
             conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
             conn.execute("PRAGMA writable_schema=OFF")
+            conn.execute(
+                "DELETE FROM state_meta WHERE key = ?",
+                (FTS_RUNTIME_QUARANTINE_KEY,),
+            )
             conn.commit()
             conn.execute("VACUUM")
         finally:
@@ -1929,6 +1938,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
+    # Emit separate diagnostics for time spent waiting to begin a transaction
+    # versus time spent executing/committing it.  Without this split, a tool
+    # call delayed by state persistence is commonly misdiagnosed as slow file
+    # I/O or as whichever child activity heartbeat happened to be newest.
+    _WRITE_WAIT_WARN_AFTER_S = 1.0
+    _WRITE_TXN_WARN_AFTER_S = 1.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -2574,6 +2589,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
+        write_started = time.monotonic()
+        lock_retries = 0
         deadline = time.monotonic() + patience_s
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
@@ -2591,17 +2608,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
+                lock_acquired_at: Optional[float] = None
+                transaction_finished_at: Optional[float] = None
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
+                    lock_acquired_at = time.monotonic()
                     try:
                         result = fn(self._conn)
                         self._conn.commit()
+                        transaction_finished_at = time.monotonic()
                     except BaseException:
                         try:
                             self._conn.rollback()
                         except Exception:
                             pass
                         raise
+                assert lock_acquired_at is not None
+                assert transaction_finished_at is not None
+                lock_wait_s = lock_acquired_at - write_started
+                transaction_s = transaction_finished_at - lock_acquired_at
+                operation = getattr(
+                    fn, "__qualname__", getattr(fn, "__name__", type(fn).__name__)
+                )
+                if lock_wait_s >= self._WRITE_WAIT_WARN_AFTER_S:
+                    logger.warning(
+                        "state.db write lock wait recovered: elapsed=%.3fs "
+                        "retries=%d patience=%.1fs operation=%s db=%s",
+                        lock_wait_s,
+                        lock_retries,
+                        patience_s,
+                        operation,
+                        self.db_path,
+                    )
+                if transaction_s >= self._WRITE_TXN_WARN_AFTER_S:
+                    logger.warning(
+                        "state.db write transaction slow: elapsed=%.3fs "
+                        "lock_wait=%.3fs operation=%s db=%s",
+                        transaction_s,
+                        lock_wait_s,
+                        operation,
+                        self.db_path,
+                    )
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -2633,6 +2680,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    lock_retries += 1
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
@@ -2733,12 +2781,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         every append; after the in-place rebuild the same append succeeds and
         search works again.
         """
-        if self._fts_runtime_rebuild_attempted:
-            return False
         if not self._fts_enabled:
             return False
         if not self._is_fts_write_corruption_error(exc):
             return False
+        if self._fts_runtime_rebuild_attempted:
+            return self._quarantine_corrupt_fts(exc)
         self._fts_runtime_rebuild_attempted = True
         logger.warning(
             "state.db write failed with an FTS-corruption error (%s) — "
@@ -2749,20 +2797,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             rebuilt = self.rebuild_fts()
         except Exception as rebuild_exc:
             logger.error(
-                "In-place FTS rebuild failed (%s); the database needs the "
-                "full offline repair path (repair_state_db_schema).",
+                "In-place FTS rebuild failed (%s); quarantining derived FTS "
+                "writes so canonical message persistence can continue until "
+                "offline repair.",
                 rebuild_exc,
             )
-            return False
+            return self._quarantine_corrupt_fts(rebuild_exc)
         if not rebuilt:
             logger.error(
-                "In-place FTS rebuild made no progress; the database needs "
-                "the full offline repair path (repair_state_db_schema)."
+                "In-place FTS rebuild made no progress; quarantining derived "
+                "FTS writes until offline repair."
             )
-            return False
+            return self._quarantine_corrupt_fts(exc)
         logger.warning(
             "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
             rebuilt,
+        )
+        return True
+
+    def _quarantine_corrupt_fts(self, exc: BaseException) -> bool:
+        """Detach corrupt derived indexes so canonical writes fail open.
+
+        The FTS tables are materialized views over ``messages``.  Dropping
+        their synchronization triggers does not modify canonical rows and is
+        enough to make the failed message append retry safely.  A durable
+        marker prevents startup from recreating triggers against the same
+        corrupt shadow tables; offline repair clears it after rebuilding FTS.
+        """
+
+        self._fts_enabled = False
+        self._trigram_available = False
+        self._fts_cjk_available = False
+
+        def _disable(conn: sqlite3.Connection) -> None:
+            for trigger in (*_FTS_TRIGGERS, *_FTS_CJK_TRIGGERS):
+                conn.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (
+                    FTS_RUNTIME_QUARANTINE_KEY,
+                    json.dumps({"at": time.time(), "error": str(exc)[:500]}),
+                ),
+            )
+
+        try:
+            self._execute_write(_disable)
+        except sqlite3.Error as quarantine_exc:
+            logger.error(
+                "Could not quarantine corrupt FTS triggers (%s); canonical "
+                "message persistence still requires offline repair.",
+                quarantine_exc,
+            )
+            return False
+
+        logger.error(
+            "Corrupt FTS indexes quarantined: synchronization triggers are "
+            "disabled, canonical message persistence is active, and search "
+            "uses fallback paths until `hermes sessions repair` rebuilds FTS."
         )
         return True
 
@@ -6246,6 +6338,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        codex_compaction_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
@@ -6291,6 +6384,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             json.dumps(codex_message_items)
             if codex_message_items else None
         )
+        codex_compaction_items_json = (
+            json.dumps(codex_compaction_items)
+            if codex_compaction_items else None
+        )
         # tool_calls may arrive as a Python list (from the live agent) or
         # as a JSON string (from import/export). Parse first to avoid
         # double-encoding.
@@ -6327,8 +6424,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_compaction_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6345,6 +6442,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_compaction_items_json,
                     platform_message_id,
                     1 if observed else 0,
                     1,
@@ -6725,6 +6823,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
+            codex_compaction_items = (
+                msg.get("codex_compaction_items") if role == "assistant" else None
+            )
             reasoning_details_json = (
                 json.dumps(reasoning_details) if reasoning_details else None
             )
@@ -6733,6 +6834,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             codex_message_items_json = (
                 json.dumps(codex_message_items) if codex_message_items else None
+            )
+            codex_compaction_items_json = (
+                json.dumps(codex_compaction_items) if codex_compaction_items else None
             )
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
@@ -6756,8 +6860,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, codex_compaction_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6774,6 +6878,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    codex_compaction_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
@@ -7229,7 +7334,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+        "codex_reasoning_items, codex_message_items, codex_compaction_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
     )
 
@@ -7328,6 +7433,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+                if row["codex_compaction_items"]:
+                    try:
+                        msg["codex_compaction_items"] = json.loads(row["codex_compaction_items"])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("Failed to deserialize codex_compaction_items, falling back to None")
+                        msg["codex_compaction_items"] = None
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)

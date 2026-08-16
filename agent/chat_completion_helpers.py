@@ -1564,6 +1564,13 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
 
+    # Provider-native server compaction is returned as an encrypted opaque
+    # item. Preserve it separately from visible content and reasoning so it
+    # can be replayed exactly without entering logs or summaries.
+    codex_compaction_items = getattr(assistant_message, "codex_compaction_items", None)
+    if codex_compaction_items:
+        msg["codex_compaction_items"] = codex_compaction_items
+
     if assistant_tool_calls:
         tool_calls = []
         for tool_call in assistant_tool_calls:
@@ -2134,7 +2141,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # timestamp (preserved on gateway user replay entries for the
             # stale-confirmation expiry check — #47868 rejection class),
             # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
+            for schema_foreign in (
+                "tool_name", "codex_reasoning_items", "codex_message_items",
+                "codex_compaction_items", "timestamp",
+            ):
                 api_msg.pop(schema_foreign, None)
             # api_content (the persist-what-you-send sidecar) carries the
             # exact bytes every main-loop call sent for this message —

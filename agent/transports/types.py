@@ -143,6 +143,11 @@ class NormalizedResponse:
         pd = self.provider_data or {}
         return pd.get("codex_message_items")
 
+    @property
+    def codex_compaction_items(self):
+        pd = self.provider_data or {}
+        return pd.get("codex_compaction_items")
+
 
 # ---------------------------------------------------------------------------
 # Factory helpers

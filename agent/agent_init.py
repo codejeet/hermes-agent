@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import inspect
 import os
 import re
 import sys
@@ -2597,7 +2598,16 @@ def init_agent(
             if isinstance(t, dict)
         }
         from agent.memory_manager import normalize_tool_schema as _normalize_tool_schema
-        for _raw_schema in agent.context_compressor.get_tool_schemas():
+        _schema_method = agent.context_compressor.get_tool_schemas
+        _schema_parameters = inspect.signature(_schema_method).parameters
+        if "is_subagent" in _schema_parameters:
+            from agent.delegation_context import is_delegated_child_context
+            _context_engine_schemas = _schema_method(
+                is_subagent=is_delegated_child_context()
+            )
+        else:
+            _context_engine_schemas = _schema_method()
+        for _raw_schema in _context_engine_schemas:
             _schema = _normalize_tool_schema(_raw_schema)
             if _schema is None:
                 # A schema with no resolvable name (e.g. an already-wrapped

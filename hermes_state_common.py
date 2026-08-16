@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -267,6 +267,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
     codex_message_items TEXT,
+    codex_compaction_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
@@ -534,6 +535,11 @@ _FTS_CJK_TRIGGERS = (
 # on are missing from the cjk index, so it must not serve reads until
 # `hermes sessions optimize-storage` rebuilds it on a capable host.
 FTS_CJK_STALE_KEY = "fts_cjk_stale"
+
+# Durable fail-open marker for corruption in derived FTS shadow tables.  When
+# set, schema initialization leaves FTS disabled and keeps canonical message
+# persistence available until an offline repair rebuilds the indexes.
+FTS_RUNTIME_QUARANTINE_KEY = "fts_runtime_quarantined"
 
 
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────

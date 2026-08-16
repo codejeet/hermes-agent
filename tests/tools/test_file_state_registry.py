@@ -123,6 +123,33 @@ class FileStateRegistryUnitTests(unittest.TestCase):
         ta.join(timeout=3.0)
         tb.join(timeout=3.0)
 
+    def test_lock_path_times_out_with_holder_context(self):
+        p = self._mk()
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold() -> None:
+            with file_state.lock_path(p, owner="holder"):
+                holder_entered.set()
+                release_holder.wait(timeout=2.0)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(holder_entered.wait(timeout=1.0))
+        started = time.monotonic()
+        try:
+            with self.assertRaises(file_state.FileStateLockTimeout) as ctx:
+                with file_state.lock_path(p, owner="waiter", timeout_s=0.05):
+                    self.fail("timed-out waiter entered the critical section")
+        finally:
+            release_holder.set()
+            thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("holder", str(ctx.exception))
+        self.assertIn(p, str(ctx.exception))
+
 
     def test_kill_switch_env_var(self):
         p = self._mk()

@@ -260,7 +260,9 @@ class TestPostStopInterruptSwallow:
         self, monkeypatch
     ):
         """The control-interrupt path must evict the session's cached agent
-        so its ``_interrupt_requested`` flag cannot leak into the next turn."""
+        so its ``_interrupt_requested`` flag cannot leak into the next turn,
+        without releasing resources that its executor worker is still using."""
+        import asyncio
         import threading
 
         from gateway.run import GatewayRunner, _INTERRUPT_REASON_STOP
@@ -275,6 +277,8 @@ class TestPostStopInterruptSwallow:
         agent = _RecordingAgent()
         agent._gateway_turn_process_task_id = "session-123"
         agent._gateway_turn_process_baseline = frozenset({"proc_existing"})
+        worker_future = asyncio.get_running_loop().create_future()
+        agent._gateway_executor_task = worker_future
         session_key = "agent:main:telegram:dm:12345"
         source = SessionSource(
             platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"
@@ -286,15 +290,25 @@ class TestPostStopInterruptSwallow:
         runner._agent_cache_lock = threading.Lock()
         runner.adapters = {}
         runner._pending_messages = {}
+        released_clients = []
+        released_clients_event = threading.Event()
+
+        def _record_soft_release(released_agent):
+            released_clients.append(released_agent)
+            released_clients_event.set()
+
+        runner._release_evicted_agent_soft = _record_soft_release
 
         invalidated = []
         runner._invalidate_session_run_generation = (
             lambda key, reason=None: invalidated.append((key, reason))
         )
         released = []
-        runner._release_running_agent_state = (
-            lambda key, **kw: released.append(key)
-        )
+        def _record_running_release(key, **kw):
+            released.append(key)
+            runner._running_agents.pop(key, None)
+
+        runner._release_running_agent_state = _record_running_release
         reaped = []
         reaped_event = threading.Event()
         from tools.process_registry import process_registry
@@ -327,3 +341,15 @@ class TestPostStopInterruptSwallow:
             "Cached agent with a set interrupt flag must be evicted on /stop "
             "so the flag cannot kill the session's next message (#44212)"
         )
+        await asyncio.sleep(0)
+        assert released_clients == [], (
+            "/stop must not close the API client or context engine while the "
+            "executor worker is still unwinding"
+        )
+
+        worker_future.set_result(None)
+        for _ in range(100):
+            if released_clients_event.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert released_clients == [agent]

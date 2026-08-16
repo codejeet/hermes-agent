@@ -1038,6 +1038,7 @@ _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
     "reasoning_details",
     "codex_reasoning_items",
     "codex_message_items",
+    "codex_compaction_items",
     "finish_reason",
 )
 
@@ -9467,6 +9468,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._cleanup_agent_resources_off_loop(agent, context=context)
 
         task = asyncio.create_task(_cleanup_when_done())
+        tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._deferred_agent_cleanup_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _defer_evicted_agent_release_until_future_done(
+        self,
+        future: asyncio.Future,
+        agent: Any,
+        *,
+        context: str,
+    ) -> None:
+        """Soft-release an evicted agent after its executor worker exits.
+
+        ``/stop`` deliberately releases the session slot immediately so a new
+        turn can start, but the interrupted executor thread may still be
+        unwinding an HTTP request or updating the context engine.  Releasing
+        clients at that point aborts the live transport and can replace the
+        context compressor with ``None`` underneath the worker.  Keep the
+        evicted agent alive until the worker's real future is complete, then
+        perform the same soft release used by normal cache eviction.
+        """
+
+        async def _release_when_done() -> None:
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Gateway shutdown owns final process teardown.  Never turn a
+                # cancelled waiter into an early release of a live worker.
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Deferred evicted-agent worker%s finished with an error: %s",
+                    f" ({context})" if context else "",
+                    exc,
+                )
+            try:
+                await asyncio.wait_for(
+                    self._run_in_executor_with_context(
+                        self._release_evicted_agent_soft, agent
+                    ),
+                    timeout=self._CLEANUP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Deferred evicted-agent release%s exceeded %ss; proceeding",
+                    f" ({context})" if context else "",
+                    self._CLEANUP_TIMEOUT_S,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Deferred evicted-agent release%s failed: %s",
+                    f" ({context})" if context else "",
+                    exc,
+                )
+
+        task = asyncio.create_task(_release_when_done())
         tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
         if tasks is None:
             tasks = set()
@@ -18046,7 +18106,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
                     except Exception:
                         _recent_transcript = []
-                    for _msg in reversed(_recent_transcript[-10:]):
+                    # Tool-heavy turns can persist hundreds of rows after the
+                    # inbound user row before a late compression exception.
+                    # ``load_transcript`` already returned the full list, so
+                    # limiting this scan to ten rows misses the same turn and
+                    # appends a duplicate user message during error recovery.
+                    for _msg in reversed(_recent_transcript):
                         if _msg.get("role") == "user":
                             _expected_user_content = (
                                 persist_user_message
@@ -23171,6 +23236,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if id(agent) in running_ids:
             return
 
+        # A control command such as /stop can release the session's running
+        # slot before the interrupted executor thread has actually returned.
+        # The cache entry must still be removed immediately (otherwise the
+        # next turn inherits the old interrupt flag), but its API client and
+        # context engine remain owned by that draining worker until the real
+        # executor future completes.
+        executor_task = getattr(agent, "_gateway_executor_task", None)
+        if executor_task is not None and not executor_task.done():
+            self._defer_evicted_agent_release_until_future_done(
+                executor_task,
+                agent,
+                context=f"cache eviction for {session_key}",
+            )
+            return
+
         try:
             threading.Thread(
                 target=self._release_evicted_agent_soft,
@@ -24932,6 +25012,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
+            _executor_agent = agent_holder[0] if agent_holder else None
+            if _executor_agent is not None:
+                # Expose the worker lifetime to control-command cache eviction.
+                # /stop unlocks the session synchronously, so _running_agents
+                # alone cannot distinguish an idle agent from one still
+                # unwinding in the executor.
+                _executor_agent._gateway_executor_task = _executor_task
+
+                def _clear_executor_task(done_task, *, _agent=_executor_agent):
+                    if getattr(_agent, "_gateway_executor_task", None) is done_task:
+                        _agent._gateway_executor_task = None
+
+                _executor_task.add_done_callback(_clear_executor_task)
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0

@@ -162,9 +162,58 @@ class TestRuntimeFtsRebuild:
         db.append_message("s1", "user", "first heal")  # consumes the one shot
         assert db._fts_runtime_rebuild_attempted is True
 
-        # Corrupt again: the guard must NOT loop — the write now propagates.
+        # Corrupt again: the guard must not rebuild-loop. Derived FTS is
+        # quarantined instead, and the canonical append still succeeds.
         _corrupt_fts(tmp_path / "state.db")
-        with pytest.raises(sqlite3.DatabaseError):
-            db.append_message("s1", "user", "second corruption")
+        db.append_message("s1", "user", "second corruption")
 
+        assert db._fts_enabled is False
+        raw = sqlite3.connect(str(tmp_path / "state.db"))
+        try:
+            assert raw.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+            ).fetchone()[0] == 0
+            assert raw.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key='fts_runtime_quarantined'"
+            ).fetchone() == (1,)
+        finally:
+            raw.close()
+
+        assert _message_contents(tmp_path / "state.db") == [
+            "seed",
+            "first heal",
+            "second corruption",
+        ]
+
+        # The quarantine is durable: reopening must not recreate FTS triggers
+        # against the known-corrupt shadow tables.
+        db.close()
+        reopened = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert reopened._fts_enabled is False
+            reopened.append_message("s1", "user", "write after reopen")
+        finally:
+            reopened.close()
+
+    def test_failed_first_rebuild_quarantines_and_retries_append(
+        self, db, tmp_path, monkeypatch
+    ):
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", "seed")
+        _corrupt_fts(tmp_path / "state.db")
+
+        def fail_rebuild():
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        monkeypatch.setattr(db, "rebuild_fts", fail_rebuild)
+        db.append_message("s1", "user", "preserved despite failed rebuild")
+
+        assert db._fts_enabled is False
+        assert _message_contents(tmp_path / "state.db")[-1] == (
+            "preserved despite failed rebuild"
+        )
 

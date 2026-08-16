@@ -5832,12 +5832,14 @@ def run_conversation(
                 interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
+                interim_has_codex_compaction_items = bool(interim_msg.get("codex_compaction_items"))
 
                 if (
                     interim_has_content
                     or interim_has_reasoning
                     or interim_has_codex_reasoning
                     or interim_has_codex_message_items
+                    or interim_has_codex_compaction_items
                 ):
                     last_msg = messages[-1] if messages else None
                     # Duplicate detection: compare only visible content
@@ -5878,6 +5880,7 @@ def run_conversation(
                             "reasoning_details",
                             "codex_reasoning_items",
                             "codex_message_items",
+                            "codex_compaction_items",
                         ):
                             if _key in interim_msg:
                                 last_msg[_key] = interim_msg[_key]
@@ -5900,6 +5903,7 @@ def run_conversation(
                         interim_has_content
                         or interim_has_codex_reasoning
                         or interim_has_codex_message_items
+                        or interim_has_codex_compaction_items
                     )
                     if not interim_replayable:
                         _last_msg = messages[-1] if messages else None

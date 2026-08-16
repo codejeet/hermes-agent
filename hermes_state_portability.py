@@ -644,6 +644,7 @@ class SessionPortabilityMixin:
                         "reasoning_details",
                         "codex_reasoning_items",
                         "codex_message_items",
+                        "codex_compaction_items",
                     ):
                         clean[key] = self._reasoning_json_value(clean.get(key))
                     sanitized_messages.append(clean)

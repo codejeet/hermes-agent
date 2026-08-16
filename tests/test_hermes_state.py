@@ -521,6 +521,24 @@ class TestMessageStorage:
         assert "reasoning" not in conv[0]
         assert "reasoning" not in conv[2]
 
+    def test_codex_compaction_capsule_persisted_and_restored(self, db):
+        db.create_session(session_id="native-compaction", source="cli")
+        capsule = [{
+            "type": "compaction",
+            "encrypted_content": "opaque-capsule",
+            "_issuer_kind": "codex_backend",
+        }]
+        db.append_message(
+            "native-compaction",
+            role="assistant",
+            content="continued",
+            codex_compaction_items=capsule,
+        )
+
+        conversation = db.get_messages_as_conversation("native-compaction")
+
+        assert conversation[0]["codex_compaction_items"] == capsule
+
 
 
 

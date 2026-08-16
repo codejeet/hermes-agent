@@ -185,9 +185,40 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     )
 
 
+@pytest.mark.asyncio
+async def test_agent_exception_dedupes_user_before_long_tool_tail(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(side_effect=RuntimeError("compression failed"))
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "hello world"},
+        *[
+            {
+                "role": "tool",
+                "tool_call_id": f"call_{index}",
+                "content": f"result {index}",
+            }
+            for index in range(20)
+        ],
+    ]
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    user_calls = [
+        call
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("role") == "user"
+    ]
+    assert user_calls == []
+
+
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
-
 

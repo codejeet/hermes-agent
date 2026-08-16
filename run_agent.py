@@ -2076,6 +2076,19 @@ class AIAgent:
                 id(item) for item in (conversation_history or [])
                 if isinstance(item, dict)
             }
+            # Gateway transcript loads carry the durable state.db row id. A
+            # context engine is allowed to deep-copy the loaded history, so
+            # object identity alone is insufficient proof that the prefix was
+            # already persisted. Match row provenance only against ids present
+            # in the caller-supplied history; this cannot be forged by a newly
+            # generated message and prevents a no-op compression copy from
+            # appending the entire transcript again.
+            history_row_ids = {
+                item.get("_row_id")
+                for item in (conversation_history or [])
+                if isinstance(item, dict)
+                and isinstance(item.get("_row_id"), int)
+            }
 
             # Bounded scan: skip the longest identity-matched prefix of the
             # list snapshot taken at the end of the previous successful flush.
@@ -2120,7 +2133,14 @@ class AIAgent:
                 # Already-durable messages: either carried over from the loaded
                 # history copy, or seeded by a caller. Stamp them so future
                 # flushes skip them without consulting any id() set again.
-                if id(msg) in history_ids or id(msg) in seed_ids:
+                if (
+                    id(msg) in history_ids
+                    or id(msg) in seed_ids
+                    or (
+                        isinstance(msg.get("_row_id"), int)
+                        and msg.get("_row_id") in history_row_ids
+                    )
+                ):
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
                 role = msg.get("role", "unknown")
@@ -2232,6 +2252,7 @@ class AIAgent:
                     "reasoning_details": msg.get("reasoning_details"),
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
+                    "codex_compaction_items": msg.get("codex_compaction_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
                     "display_kind": (
@@ -4198,6 +4219,29 @@ class AIAgent:
         except Exception:
             pass
 
+        # The soft-evicted AIAgent object is discarded and rebuilt on resume.
+        # Its cloned context engine is therefore instance-owned just like the
+        # client pools above; retaining it leaks SQLite handles and background
+        # workers even though terminal/browser/process state remains external
+        # and resumable by task_id.
+        self._release_context_engine()
+
+    def _release_context_engine(self) -> None:
+        """Idempotently release the context engine owned by this agent."""
+        try:
+            context_engine = getattr(self, "context_compressor", None)
+            if context_engine is None:
+                return
+            # Clear ownership before calling plugin code. A raising shutdown
+            # must not leave a stale half-closed engine available for reuse or
+            # make a later close() decrement shared storage twice.
+            self.context_compressor = None
+            shutdown = getattr(context_engine, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -4288,6 +4332,13 @@ class AIAgent:
                 codex_session.close()
         except Exception:
             pass
+
+        # 6d. Release context-engine resources. Plugin engines are cloned per
+        # agent and may own SQLite connections, worker threads, or file handles.
+        # Session finalization is handled by shutdown_memory_provider() before
+        # close(); this hook is strictly resource teardown. Clear the attribute
+        # first so repeated close() calls cannot double-release shared storage.
+        self._release_context_engine()
 
         # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
@@ -7654,6 +7705,8 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            delegated_scope=function_args.get("delegated_scope"),
+            kept_work=function_args.get("kept_work"),
             background=(not _is_subagent),
             parent_agent=self,
         )

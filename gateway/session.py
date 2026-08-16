@@ -3265,6 +3265,7 @@ class SessionStore:
             reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
             codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
             codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+            codex_compaction_items=message.get("codex_compaction_items") if message.get("role") == "assistant" else None,
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
             observed=bool(message.get("observed")),
             timestamp=message.get("timestamp"),
@@ -3392,7 +3393,9 @@ class SessionStore:
             # would otherwise re-trigger the pre-request repair on every
             # request forever — heal it once at the restore boundary.
             return self._db.get_messages_as_conversation(
-                session_id, repair_alternation=True
+                session_id,
+                repair_alternation=True,
+                include_row_ids=True,
             )
         except Exception as e:
             logger.debug("Could not load messages from DB: %s", e)

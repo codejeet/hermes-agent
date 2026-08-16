@@ -518,10 +518,15 @@ class TestDelegationCleanup:
                 profile_key=str(profile_home),
                 session_id=child.session_id,
             )
+            # The timeout caller has returned, but the worker still owns and
+            # uses the child. Closing here would tear down its context engine
+            # mid-loop and crash with context_compressor=None.
+            child.close.assert_not_called()
             relay_host.unregister_subagent.assert_not_called()
 
             release_child.set()
             assert child_finished.wait(timeout=5)
+            child.close.assert_called_once_with()
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,

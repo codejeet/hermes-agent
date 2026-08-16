@@ -6,8 +6,9 @@ pure-text assistant turn (no ``tool_calls``) is replayed, the simple-text
 branch in ``run_sync`` used to whitelist only three reasoning fields:
 ``reasoning``, ``reasoning_details``, ``codex_reasoning_items``.
 
-That whitelist predated three fields the DB now persists:
-``reasoning_content``, ``codex_message_items``, and ``finish_reason``.  The
+That whitelist predated provider continuity fields the DB now persists,
+including ``reasoning_content``, ``codex_message_items``, opaque
+``codex_compaction_items``, and ``finish_reason``.  The
 unrecovered drop of ``codex_message_items`` in particular kills prefix-cache
 hits for OpenAI Codex Responses API users — OpenAI's docs require the
 ``phase`` field be replayed on every assistant message.
@@ -52,13 +53,14 @@ class TestBuildReplayEntry:
             "reasoning_details": [],
             "codex_reasoning_items": [],
             "codex_message_items": [],
+            "codex_compaction_items": [],
             "finish_reason": "",
         }
         entry = _build_replay_entry("assistant", "answer", msg)
         assert entry == {"role": "assistant", "content": "answer"}
 
 
-    def test_assistant_preserves_all_six_fields_together(self):
+    def test_assistant_preserves_all_provider_fields_together(self):
         details = [{"type": "reasoning.summary", "summary": "s"}]
         codex_items = [{"type": "reasoning", "encrypted_content": "b"}]
         msg_items = [
@@ -69,6 +71,10 @@ class TestBuildReplayEntry:
                 "content": [{"type": "output_text", "text": "x"}],
             }
         ]
+        compaction_items = [{
+            "type": "compaction",
+            "encrypted_content": "opaque-capsule",
+        }]
         msg = {
             "role": "assistant",
             "content": "answer",
@@ -77,6 +83,7 @@ class TestBuildReplayEntry:
             "reasoning_details": details,
             "codex_reasoning_items": codex_items,
             "codex_message_items": msg_items,
+            "codex_compaction_items": compaction_items,
             "finish_reason": "stop",
         }
         entry = _build_replay_entry("assistant", "answer", msg)
@@ -85,6 +92,7 @@ class TestBuildReplayEntry:
         assert entry["reasoning_details"] == details
         assert entry["codex_reasoning_items"] == codex_items
         assert entry["codex_message_items"] == msg_items
+        assert entry["codex_compaction_items"] == compaction_items
         assert entry["finish_reason"] == "stop"
 
 
@@ -96,6 +104,7 @@ class TestBuildReplayEntry:
             "reasoning_details",
             "codex_reasoning_items",
             "codex_message_items",
+            "codex_compaction_items",
             "finish_reason",
         )
 
@@ -142,4 +151,3 @@ class TestGatewayHistoryBuildForwardsSidecar:
         ]
         agent_history, _obs = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
-

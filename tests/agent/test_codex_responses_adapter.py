@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +226,138 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
     assert assistant_message.content == ""
     assert assistant_message.reasoning == "still thinking"
     assert assistant_message.codex_reasoning_items is None
+
+
+def test_codex_native_compaction_item_round_trips_without_id():
+    response = SimpleNamespace(
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="compaction",
+                id="cmp_123",
+                encrypted_content="opaque-compaction-capsule",
+                status="completed",
+            ),
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="done")],
+            ),
+        ],
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(
+        response, issuer_kind="codex_backend"
+    )
+
+    assert finish_reason == "stop"
+    assert assistant_message.codex_compaction_items == [{
+        "type": "compaction",
+        "encrypted_content": "opaque-compaction-capsule",
+        "_issuer_kind": "codex_backend",
+        "id": "cmp_123",
+    }]
+    replay = _chat_messages_to_responses_input([{
+        "role": "assistant",
+        "content": "done",
+        "codex_compaction_items": assistant_message.codex_compaction_items,
+    }], current_issuer_kind="codex_backend")
+    assert replay[0] == {
+        "type": "compaction",
+        "encrypted_content": "opaque-compaction-capsule",
+    }
+    assert "id" not in replay[0]
+
+
+def test_codex_native_compaction_prunes_obsolete_request_prefix():
+    replay = _chat_messages_to_responses_input(
+        [
+            {"role": "user", "content": "obsolete prefix"},
+            {
+                "role": "assistant",
+                "content": "boundary answer",
+                "codex_compaction_items": [{
+                    "type": "compaction",
+                    "encrypted_content": "opaque-compaction-capsule",
+                    "_issuer_kind": "codex_backend",
+                }],
+            },
+            {"role": "user", "content": "current suffix"},
+        ],
+        current_issuer_kind="codex_backend",
+    )
+
+    assert replay[0]["type"] == "compaction"
+    assert all("obsolete prefix" not in str(item) for item in replay)
+    assert any("current suffix" in str(item) for item in replay)
+
+
+def test_codex_foreign_compaction_does_not_prune_request_prefix():
+    replay = _chat_messages_to_responses_input(
+        [
+            {"role": "user", "content": "keep this prefix"},
+            {
+                "role": "assistant",
+                "content": "foreign boundary",
+                "codex_compaction_items": [{
+                    "type": "compaction",
+                    "encrypted_content": "foreign-capsule",
+                    "_issuer_kind": "xai_responses",
+                }],
+            },
+        ],
+        current_issuer_kind="codex_backend",
+    )
+
+    assert "keep this prefix" in str(replay[0])
+    assert all(item.get("type") != "compaction" for item in replay)
+
+
+def test_codex_preflight_preserves_native_context_management():
+    normalized = _preflight_codex_api_kwargs({
+        "model": "gpt-5.6-sol",
+        "instructions": "test",
+        "input": [{"role": "user", "content": "hello"}],
+        "store": False,
+        "reasoning": {"effort": "high", "context": "all_turns"},
+        "context_management": [{
+            "type": "compaction",
+            "compact_threshold": 175000,
+        }],
+    })
+
+    assert normalized["reasoning"]["context"] == "all_turns"
+    assert normalized["context_management"] == [{
+        "type": "compaction",
+        "compact_threshold": 175000,
+    }]
+
+
+def test_codex_transport_enables_native_continuity_only_on_gpt56_backend(monkeypatch):
+    from agent.transports.codex import ResponsesApiTransport
+
+    monkeypatch.delenv("HERMES_CODEX_NATIVE_COMPACTION_THRESHOLD", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(DEFAULT_AGENT_IDENTITY="test identity"),
+    )
+    transport = ResponsesApiTransport()
+    native = transport.build_kwargs(
+        "gpt-5.6-sol",
+        [{"role": "user", "content": "hello"}],
+        is_codex_backend=True,
+    )
+    unsupported = transport.build_kwargs(
+        "gpt-5.5-codex",
+        [{"role": "user", "content": "hello"}],
+        is_codex_backend=True,
+    )
+
+    assert native["reasoning"]["context"] == "all_turns"
+    assert native["context_management"][0]["compact_threshold"] == 175000
+    assert "context_management" not in unsupported
 
 
 

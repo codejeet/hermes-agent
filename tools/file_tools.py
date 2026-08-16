@@ -1802,7 +1802,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # Serialize the read→modify→write region per-path so concurrent
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
-        with file_state.lock_path(_resolved):
+        with file_state.lock_path(_resolved, owner=task_id):
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -1922,7 +1922,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         from contextlib import ExitStack
         with ExitStack() as _locks:
             for _r in _resolved_paths:
-                _locks.enter_context(file_state.lock_path(_r))
+                _locks.enter_context(file_state.lock_path(_r, owner=task_id))
 
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.

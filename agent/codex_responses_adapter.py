@@ -459,10 +459,39 @@ def _chat_messages_to_responses_input(
     (drops ALL replay); ``current_issuer_kind`` is the per-item filter
     that runs only when replay is still enabled.
     """
+    # Once the provider has emitted a compaction capsule, that capsule is the
+    # canonical replacement for every earlier Responses input item.  Keep the
+    # durable transcript in state.db/LCM, but do not resend an ever-growing
+    # obsolete prefix over HTTP.  Only trust a capsule from the current issuer;
+    # pruning at a foreign-provider boundary would destroy usable context.
+    canonical_messages = messages
+    for index in range(len(messages) - 1, -1, -1):
+        candidate = messages[index]
+        if not isinstance(candidate, dict) or candidate.get("role") != "assistant":
+            continue
+        compaction_items = candidate.get("codex_compaction_items")
+        if not isinstance(compaction_items, list):
+            continue
+        has_compatible_capsule = any(
+            isinstance(item, dict)
+            and item.get("type") == "compaction"
+            and isinstance(item.get("encrypted_content"), str)
+            and bool(item.get("encrypted_content"))
+            and (
+                current_issuer_kind is None
+                or item.get("_issuer_kind") is None
+                or item.get("_issuer_kind") == current_issuer_kind
+            )
+            for item in compaction_items
+        )
+        if has_compatible_capsule:
+            canonical_messages = messages[index:]
+            break
+
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
 
-    for msg in messages:
+    for msg in canonical_messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -482,6 +511,29 @@ def _chat_messages_to_responses_input(
                 content_text = str(content) if content is not None else ""
 
             if role == "assistant":
+                # Replay provider-generated compaction capsules before the
+                # rest of the assistant turn.  These are opaque, encrypted
+                # Responses items: Hermes must preserve them byte-for-byte,
+                # but must never inspect or summarize their contents.
+                codex_compaction_items = msg.get("codex_compaction_items")
+                if isinstance(codex_compaction_items, list):
+                    for raw_item in codex_compaction_items:
+                        if not isinstance(raw_item, dict):
+                            continue
+                        encrypted = raw_item.get("encrypted_content")
+                        if raw_item.get("type") != "compaction" or not isinstance(encrypted, str) or not encrypted:
+                            continue
+                        item_issuer = raw_item.get("_issuer_kind")
+                        if (
+                            current_issuer_kind is not None
+                            and item_issuer is not None
+                            and item_issuer != current_issuer_kind
+                        ):
+                            continue
+                        # store=False makes response item IDs non-replayable;
+                        # encrypted_content is the self-contained capsule.
+                        items.append({"type": "compaction", "encrypted_content": encrypted})
+
                 # Replay encrypted reasoning items from previous turns
                 # so the API can maintain coherent reasoning chains.
                 # This applies to every Responses transport including
@@ -822,6 +874,17 @@ def _preflight_codex_input_items(
                 normalized.append(reasoning_item)
             continue
 
+        if item_type == "compaction":
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                # As with reasoning capsules, IDs cannot be resolved when
+                # store=False.  The encrypted payload is canonical.
+                normalized.append({
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                })
+            continue
+
         if item_type == "message":
             role = item.get("role")
             if role != "assistant":
@@ -1028,7 +1091,7 @@ def _preflight_codex_api_kwargs(
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
-        "reasoning", "include", "max_output_tokens", "temperature",
+        "reasoning", "include", "context_management", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key",
         "prompt_cache_retention", "service_tier",
         "extra_headers", "extra_body", "timeout",
@@ -1046,6 +1109,20 @@ def _preflight_codex_api_kwargs(
     reasoning = api_kwargs.get("reasoning")
     if isinstance(reasoning, dict):
         normalized["reasoning"] = reasoning
+    context_management = api_kwargs.get("context_management")
+    if isinstance(context_management, list):
+        normalized_context_management = []
+        for item in context_management:
+            if not isinstance(item, dict) or item.get("type") != "compaction":
+                continue
+            threshold = item.get("compact_threshold")
+            if isinstance(threshold, int) and not isinstance(threshold, bool) and threshold > 0:
+                normalized_context_management.append({
+                    "type": "compaction",
+                    "compact_threshold": threshold,
+                })
+        if normalized_context_management:
+            normalized["context_management"] = normalized_context_management
     include = api_kwargs.get("include")
     if isinstance(include, list):
         normalized["include"] = include
@@ -1294,6 +1371,7 @@ def _normalize_codex_response(
     reasoning_parts: List[str] = []
     reasoning_items_raw: List[Dict[str, Any]] = []
     message_items_raw: List[Dict[str, Any]] = []
+    compaction_items_raw: List[Dict[str, Any]] = []
     tool_calls: List[Any] = []
     has_incomplete_items = response_status in {"queued", "in_progress", "incomplete"}
     saw_streaming_or_item_incomplete = response_status in {"queued", "in_progress"}
@@ -1343,7 +1421,20 @@ def _normalize_codex_response(
             has_incomplete_items = True
             saw_streaming_or_item_incomplete = True
 
-        if item_type == "message":
+        if item_type == "compaction":
+            encrypted = getattr(item, "encrypted_content", None)
+            if isinstance(encrypted, str) and encrypted:
+                raw_compaction_item: Dict[str, Any] = {
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                }
+                if issuer_kind:
+                    raw_compaction_item["_issuer_kind"] = issuer_kind
+                item_id = getattr(item, "id", None)
+                if isinstance(item_id, str) and item_id:
+                    raw_compaction_item["id"] = item_id
+                compaction_items_raw.append(raw_compaction_item)
+        elif item_type == "message":
             item_phase = getattr(item, "phase", None)
             normalized_phase = None
             is_commentary_phase = False
@@ -1549,6 +1640,7 @@ def _normalize_codex_response(
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        codex_compaction_items=compaction_items_raw or None,
     )
 
     if tool_calls:

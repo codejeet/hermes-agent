@@ -17,6 +17,7 @@ from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
+    FTS_RUNTIME_QUARANTINE_KEY,
     FTS_SQL,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
@@ -968,7 +969,23 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError:
             pass  # Index already exists
 
-        if fts5_available:
+        fts_quarantined = bool(
+            cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (FTS_RUNTIME_QUARANTINE_KEY,),
+            ).fetchone()
+        )
+        if fts_quarantined:
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_available = False
+            logger.error(
+                "state.db FTS indexes are quarantined after runtime corruption; "
+                "canonical message persistence remains enabled and search "
+                "falls back to non-FTS paths. Run `hermes sessions repair` "
+                "offline to rebuild the derived indexes."
+            )
+        elif fts5_available:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.

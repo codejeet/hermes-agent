@@ -26,6 +26,11 @@ from hermes_state import (
     SessionDB,
     _db_opens_cleanly,
 )
+from hermes_state_common import (
+    FTS_RUNTIME_QUARANTINE_KEY,
+    _FTS_CJK_TRIGGERS,
+    _FTS_TRIGGERS,
+)
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -55,6 +60,7 @@ _GENERATED_META_KEYS = frozenset({
     "fts_cjk_stale",
     "fts_cjk_rebuild_high_water",
     "fts_cjk_rebuild_progress",
+    FTS_RUNTIME_QUARANTINE_KEY,
     "telegram_dm_topic_schema_version",
 })
 
@@ -1255,6 +1261,28 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
     return result
 
 
+def _suspend_derived_fts_triggers(destination: sqlite3.Connection) -> None:
+    """Keep canonical recovery copies independent from derived FTS writes.
+
+    A fresh :class:`SessionDB` installs synchronous FTS triggers.  Leaving
+    them active makes recovery index every message one row at a time while it
+    is copied, which is needlessly slow for large stores and makes recovery
+    vulnerable to an index failure even though FTS is derived state.  Drop
+    only those triggers here.  Reopening ``SessionDB`` after the canonical
+    copy recreates the triggers and bulk-rebuilds the empty indexes.
+    """
+
+    for trigger in (*_FTS_TRIGGERS, *_FTS_CJK_TRIGGERS):
+        destination.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+
+
+def _rebuild_recovery_fts(output: Path) -> None:
+    """Restore FTS triggers and indexes after an offline canonical copy."""
+
+    rebuilt = SessionDB(db_path=output)
+    rebuilt.close()
+
+
 def recover_session_database(
     source_path: Path,
     output_path: Path,
@@ -1325,6 +1353,7 @@ def recover_session_database(
                 timeout=1.0,
             )
             destination_conn.execute("PRAGMA foreign_keys=OFF")
+            _suspend_derived_fts_triggers(destination_conn)
 
             copy_report: dict[str, dict[str, Any]] = {}
             for table in _CANONICAL_TABLES:
@@ -1381,6 +1410,20 @@ def recover_session_database(
                 _cleanup_partial_orphans(destination_conn)
                 if allow_partial
                 else None
+            )
+            destination_conn.close()
+            destination_conn = None
+
+            # Reopen through SessionDB only after every canonical row and
+            # orphan repair is durable.  Its trigger-repair path performs one
+            # bulk FTS rebuild instead of indexing each recovered message in
+            # the copy loop.
+            _rebuild_recovery_fts(output)
+
+            destination_conn = sqlite3.connect(
+                str(output),
+                isolation_level=None,
+                timeout=1.0,
             )
             derived_metadata = _finalize_derived_metadata(destination_conn)
         finally:

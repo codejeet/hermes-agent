@@ -451,6 +451,8 @@ class TestLoadTranscriptDBOnly:
         assert len(result) == 2
         assert result[0]["content"] == "db-q"
         assert result[1]["content"] == "db-a"
+        assert isinstance(result[0].get("_row_id"), int)
+        assert isinstance(result[1].get("_row_id"), int)
 
 
 class TestSessionStoreSwitchSession:
@@ -1528,5 +1530,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

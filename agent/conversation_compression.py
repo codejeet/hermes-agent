@@ -1349,6 +1349,7 @@ def _supported_compression_kwargs(
     focus_topic: Optional[str],
     force: bool,
     memory_context: str,
+    progress_callback: Optional[Callable[[], None]] = None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1362,6 +1363,8 @@ def _supported_compression_kwargs(
         "focus_topic": focus_topic,
         "force": force,
     }
+    if callable(progress_callback):
+        candidates["progress_callback"] = progress_callback
     if memory_context:
         candidates["memory_context"] = memory_context
     try:
@@ -2761,6 +2764,9 @@ def compress_context(
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            progress_callback=(
+                commit_fence.touch_progress if commit_fence is not None else None
+            ),
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(

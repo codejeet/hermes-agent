@@ -100,6 +100,53 @@ def _make_source(path: Path) -> dict[str, int]:
     return {"sessions": 3, "messages": 21}
 
 
+def test_recovery_suspends_fts_triggers_during_copy_and_rebuilds_afterward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    expected = _make_source(source)
+    original_copy_table = session_recovery._copy_table
+    observed_trigger_counts: list[int] = []
+
+    def checking_copy_table(source_conn, destination_conn, table, **kwargs):
+        if table == "messages":
+            observed_trigger_counts.append(
+                int(
+                    destination_conn.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                    ).fetchone()[0]
+                )
+            )
+        return original_copy_table(
+            source_conn,
+            destination_conn,
+            table,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(session_recovery, "_copy_table", checking_copy_table)
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert observed_trigger_counts == [0]
+    assert report["complete"] is True
+    with sqlite3.connect(str(output)) as recovered:
+        assert recovered.execute(
+            "SELECT COUNT(*) FROM messages"
+        ).fetchone()[0] == expected["messages"]
+        assert recovered.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+        ).fetchone()[0] == 6
+        assert recovered.execute(
+            "SELECT COUNT(*) FROM messages_fts "
+            "WHERE messages_fts MATCH 'recoverable'"
+        ).fetchone()[0] == expected["messages"]
+
+
 def _orphan_fts_schema(path: Path) -> None:
     conn = sqlite3.connect(str(path), isolation_level=None)
     try:
@@ -646,6 +693,5 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         )
     finally:
         conn.close()
-
 
 
