@@ -886,6 +886,15 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert DEFAULT_AGENT_IDENTITY in prompt
 
+    def test_kanban_worker_prompt_includes_anti_overcomplication_guardrail(self, agent):
+        agent._kanban_worker_guidance = "# Kanban task execution protocol"
+
+        prompt = agent._build_system_prompt()
+
+        assert "# Anti-overcomplication check" in prompt
+        assert "security theatre" in prompt
+        assert "anti_overcomplication" in prompt
+
     def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("terminal")),

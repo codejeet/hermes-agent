@@ -4829,6 +4829,10 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class AntiOvercomplicationRequiredError(ValueError):
+    """Raised when managed implementation work skips its final simplification pass."""
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4872,6 +4876,33 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # Dispatcher-owned implementation runs must carry the final simplification
+    # attestation regardless of whether completion came through the structured
+    # tool, the CLI, or a direct module import. Manual operator completion has
+    # no expected_run_id and remains available for recovery/administration.
+    if expected_run_id is not None:
+        from agent.kanban_guardrails import (
+            implementation_requires_check,
+            normalize_anti_overcomplication,
+        )
+
+        completing_task = get_task(conn, task_id)
+        if implementation_requires_check(completing_task, metadata):
+            try:
+                anti = normalize_anti_overcomplication(
+                    metadata.get("anti_overcomplication")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+            except ValueError as exc:
+                raise AntiOvercomplicationRequiredError(
+                    "Implementation completion blocked: perform the final "
+                    "anti-overcomplication pass and include metadata."
+                    "anti_overcomplication with checked=true and removed=[...]."
+                ) from exc
+            metadata = dict(metadata or {})
+            metadata["anti_overcomplication"] = anti
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

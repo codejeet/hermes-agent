@@ -33,6 +33,10 @@ import logging
 import os
 from typing import Any, Optional
 
+from agent.kanban_guardrails import (
+    implementation_requires_check,
+    normalize_anti_overcomplication,
+)
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
@@ -631,6 +635,18 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    anti_overcomplication = args.get("anti_overcomplication")
+    if anti_overcomplication is not None:
+        try:
+            anti_overcomplication = normalize_anti_overcomplication(
+                anti_overcomplication
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+        anti_json = redact_sensitive_text(
+            json.dumps(anti_overcomplication), force=True
+        )
+        anti_overcomplication = json.loads(anti_json)
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -704,6 +720,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if anti_overcomplication is not None:
+        metadata = dict(metadata or {})
+        metadata["anti_overcomplication"] = anti_overcomplication
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -715,6 +734,15 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            if implementation_requires_check(task, metadata):
+                if anti_overcomplication is None:
+                    return tool_error(
+                        "Implementation completion blocked: perform the final "
+                        "anti-overcomplication pass, simplify anything unrequested, "
+                        "then retry with anti_overcomplication={checked: true, "
+                        "removed: [...], note: optional}. Use removed=[] when the "
+                        "pass found nothing extra."
+                    )
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -759,6 +787,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.AntiOvercomplicationRequiredError as anti_err:
+                return tool_error(str(anti_err))
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -1628,7 +1658,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. Implementation "
+        "work also requires the small ``anti_overcomplication`` attestation "
+        "after a final simplification pass; the completion gate rejects "
+        "worktree/project-dir changes that omit it."
     ),
     "parameters": {
         "type": "object",
@@ -1653,6 +1686,26 @@ KANBAN_COMPLETE_SCHEMA = {
                     "\"findings\": [...]}. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
+            },
+            "anti_overcomplication": {
+                "type": "object",
+                "description": (
+                    "Required for implementation work after inspecting the final "
+                    "diff/product and removing unrequested complexity. Set "
+                    "checked=true; list concrete removals in removed (or []); "
+                    "optionally use note for the concrete reason a questionable "
+                    "control remains. This is a check, not another review card."
+                ),
+                "properties": {
+                    "checked": {"type": "boolean", "const": True},
+                    "removed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "note": {"type": "string"},
+                },
+                "required": ["checked", "removed"],
+                "additionalProperties": False,
             },
             "result": {
                 "type": "string",

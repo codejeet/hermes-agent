@@ -30,6 +30,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent.kanban_guardrails import append_kanban_guardrails
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -237,10 +238,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # this block. Resolved once at __init__ (see _kanban_worker_guidance).
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance:
-        tool_guidance.append(_kanban_guidance)
+        tool_guidance.append(append_kanban_guardrails(_kanban_guidance))
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        tool_guidance.append(append_kanban_guardrails(KANBAN_GUIDANCE))
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
