@@ -2221,7 +2221,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     metadata=metadata,
                     expected_run_id=_worker_run_id_for(tid),
                 )
-            except kb.AntiOvercomplicationRequiredError as exc:
+            except (
+                kb.AntiOvercomplicationRequiredError,
+                kb.ProductionE2ERequiredError,
+            ) as exc:
                 failed.append(tid)
                 print(f"kanban: {exc}", file=sys.stderr)
                 continue

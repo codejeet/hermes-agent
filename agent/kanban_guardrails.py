@@ -32,14 +32,39 @@ simplification pass, not a request for another checklist, document, review lane,
 card. Do not create another card for this check.
 """
 
+KANBAN_PRODUCTION_E2E_GUIDANCE = """# Real production E2E
+
+When a card deploys a user-facing feature, E2E must exercise the actual feature
+against the real production deployment. A mock, provider-disabled route, DOM-only
+assertion, preview environment, or synthetic substitute does not close production E2E.
+
+Use the AJ test client and create or update clearly labeled production test objects as
+needed. Those test objects may remain; cleanup is not an acceptance gate. If the
+feature calls, texts, or emails, the only authorized real targets are
+`+1 818-447-8271` or `aj@scalesystem.ai`. Never contact any other client or lead.
+Use one authorized target unless the feature itself requires both channels, and verify
+the authoritative application/provider outcome rather than only a click or request.
+
+Before `kanban_complete` on a production-deploy card, pass:
+`production_e2e={"checked": true, "environment": "production",
+"feature_exercised": "what actually ran", "target": "AJ test client",
+"external_action": false}`.
+Allowed targets are `AJ test client`, `production public surface`,
+`+1 818-447-8271`, and `aj@scalesystem.ai`. Set `external_action=true` only for an
+actual call, text, or email to one of the two authorized contact targets.
+"""
+
 _IMPLEMENTATION_WORKSPACE_KINDS = frozenset({"worktree", "dir"})
 
 
 def append_kanban_guardrails(base_guidance: str) -> str:
     """Append the worker guardrail once, preserving prompt cache stability."""
-    if "# Anti-overcomplication check" in base_guidance:
-        return base_guidance
-    return f"{base_guidance.rstrip()}\n\n{KANBAN_ANTI_OVERCOMPLICATION_GUIDANCE.strip()}"
+    sections = [base_guidance.rstrip()]
+    if "# Anti-overcomplication check" not in base_guidance:
+        sections.append(KANBAN_ANTI_OVERCOMPLICATION_GUIDANCE.strip())
+    if "# Real production E2E" not in base_guidance:
+        sections.append(KANBAN_PRODUCTION_E2E_GUIDANCE.strip())
+    return "\n\n".join(sections)
 
 
 def implementation_requires_check(task: Any, metadata: Optional[Mapping[str, Any]]) -> bool:
@@ -53,6 +78,24 @@ def implementation_requires_check(task: Any, metadata: Optional[Mapping[str, Any
     if workspace_kind in _IMPLEMENTATION_WORKSPACE_KINDS:
         return True
     return bool(isinstance(metadata, Mapping) and metadata.get("changed_files"))
+
+
+def production_e2e_required(task: Any) -> bool:
+    """Return whether the card explicitly includes a production deployment."""
+    text = " ".join(
+        str(getattr(task, field, "") or "") for field in ("title", "body")
+    ).lower()
+    if any(marker in text for marker in ("do not deploy", "local-only", "local only")):
+        return False
+    production = any(
+        marker in text
+        for marker in ("production", "app.salesystem.ai", "live build", "live deployment")
+    )
+    deployment = any(
+        marker in text
+        for marker in ("deploy", "production smoke", "production e2e", "live build")
+    )
+    return production and deployment
 
 
 def normalize_anti_overcomplication(value: Any) -> dict[str, Any]:
@@ -78,3 +121,49 @@ def normalize_anti_overcomplication(value: Any) -> dict[str, Any]:
         if note.strip():
             normalized["note"] = note.strip()
     return normalized
+
+
+_PRODUCTION_E2E_TARGETS = frozenset(
+    {
+        "AJ test client",
+        "production public surface",
+        "+1 818-447-8271",
+        "aj@scalesystem.ai",
+    }
+)
+_EXTERNAL_E2E_TARGETS = frozenset({"+1 818-447-8271", "aj@scalesystem.ai"})
+
+
+def normalize_production_e2e(value: Any) -> dict[str, Any]:
+    """Validate the live production exercise and its authorized target."""
+    if not isinstance(value, Mapping):
+        raise ValueError("production_e2e must be an object describing the real production run")
+    if value.get("checked") is not True:
+        raise ValueError("production_e2e.checked must be true after exercising production")
+    if value.get("environment") != "production":
+        raise ValueError("production_e2e.environment must be exactly 'production'")
+
+    feature = value.get("feature_exercised")
+    if not isinstance(feature, str) or not feature.strip():
+        raise ValueError("production_e2e.feature_exercised must name what actually ran")
+    target = value.get("target")
+    if target not in _PRODUCTION_E2E_TARGETS:
+        raise ValueError(
+            "production_e2e.target must be AJ test client, production public surface, "
+            "+1 818-447-8271, or aj@scalesystem.ai"
+        )
+    external_action = value.get("external_action")
+    if not isinstance(external_action, bool):
+        raise ValueError("production_e2e.external_action must be true or false")
+    if external_action != (target in _EXTERNAL_E2E_TARGETS):
+        raise ValueError(
+            "external_action must be true only for the authorized phone or email target"
+        )
+
+    return {
+        "checked": True,
+        "environment": "production",
+        "feature_exercised": feature.strip(),
+        "target": target,
+        "external_action": external_action,
+    }

@@ -4833,6 +4833,10 @@ class AntiOvercomplicationRequiredError(ValueError):
     """Raised when managed implementation work skips its final simplification pass."""
 
 
+class ProductionE2ERequiredError(ValueError):
+    """Raised when a production deploy skips the real live feature exercise."""
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4885,6 +4889,8 @@ def complete_task(
         from agent.kanban_guardrails import (
             implementation_requires_check,
             normalize_anti_overcomplication,
+            normalize_production_e2e,
+            production_e2e_required,
         )
 
         completing_task = get_task(conn, task_id)
@@ -4903,6 +4909,23 @@ def complete_task(
                 ) from exc
             metadata = dict(metadata or {})
             metadata["anti_overcomplication"] = anti
+
+        if production_e2e_required(completing_task):
+            try:
+                production_e2e = normalize_production_e2e(
+                    metadata.get("production_e2e")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+            except ValueError as exc:
+                raise ProductionE2ERequiredError(
+                    "Production deployment completion blocked: exercise the actual "
+                    "feature in real production using only the AJ test client, "
+                    "+1 818-447-8271, aj@scalesystem.ai, or the production public "
+                    "surface; then include metadata.production_e2e."
+                ) from exc
+            metadata = dict(metadata or {})
+            metadata["production_e2e"] = production_e2e
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

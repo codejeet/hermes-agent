@@ -36,6 +36,8 @@ from typing import Any, Optional
 from agent.kanban_guardrails import (
     implementation_requires_check,
     normalize_anti_overcomplication,
+    normalize_production_e2e,
+    production_e2e_required,
 )
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -636,6 +638,7 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = args.get("metadata")
     result = args.get("result")
     anti_overcomplication = args.get("anti_overcomplication")
+    production_e2e = args.get("production_e2e")
     if anti_overcomplication is not None:
         try:
             anti_overcomplication = normalize_anti_overcomplication(
@@ -647,6 +650,15 @@ def _handle_complete(args: dict, **kw) -> str:
             json.dumps(anti_overcomplication), force=True
         )
         anti_overcomplication = json.loads(anti_json)
+    if production_e2e is not None:
+        try:
+            production_e2e = normalize_production_e2e(production_e2e)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        production_e2e = dict(production_e2e)
+        production_e2e["feature_exercised"] = redact_sensitive_text(
+            production_e2e["feature_exercised"], force=True
+        )
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -723,6 +735,9 @@ def _handle_complete(args: dict, **kw) -> str:
     if anti_overcomplication is not None:
         metadata = dict(metadata or {})
         metadata["anti_overcomplication"] = anti_overcomplication
+    if production_e2e is not None:
+        metadata = dict(metadata or {})
+        metadata["production_e2e"] = production_e2e
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -743,6 +758,15 @@ def _handle_complete(args: dict, **kw) -> str:
                         "removed: [...], note: optional}. Use removed=[] when the "
                         "pass found nothing extra."
                     )
+            if production_e2e_required(task) and production_e2e is None:
+                return tool_error(
+                    "Real production E2E required: exercise the actual deployed "
+                    "feature in production, then retry with production_e2e={checked: "
+                    "true, environment: production, feature_exercised: ..., target: "
+                    "AJ test client|production public surface|+1 818-447-8271|"
+                    "aj@scalesystem.ai, external_action: true|false}. Never contact "
+                    "any non-AJ client."
+                )
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -789,6 +813,8 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             except kb.AntiOvercomplicationRequiredError as anti_err:
                 return tool_error(str(anti_err))
+            except kb.ProductionE2ERequiredError as e2e_err:
+                return tool_error(str(e2e_err))
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -1661,7 +1687,9 @@ KANBAN_COMPLETE_SCHEMA = {
         "instead of being a path they have to fetch by hand. Implementation "
         "work also requires the small ``anti_overcomplication`` attestation "
         "after a final simplification pass; the completion gate rejects "
-        "worktree/project-dir changes that omit it."
+        "worktree/project-dir changes that omit it. Cards that deploy to "
+        "production also require ``production_e2e`` proving the actual feature "
+        "was exercised on the live deployment using only an authorized AJ target."
     ),
     "parameters": {
         "type": "object",
@@ -1705,6 +1733,39 @@ KANBAN_COMPLETE_SCHEMA = {
                     "note": {"type": "string"},
                 },
                 "required": ["checked", "removed"],
+                "additionalProperties": False,
+            },
+            "production_e2e": {
+                "type": "object",
+                "description": (
+                    "Required when the card deploys a feature to production. Exercise "
+                    "the actual live feature, not a mock/preview/provider-disabled "
+                    "substitute. Production test objects may remain. Use only the AJ "
+                    "test client, production public surface, +1 818-447-8271, or "
+                    "aj@scalesystem.ai; never contact another client."
+                ),
+                "properties": {
+                    "checked": {"type": "boolean", "const": True},
+                    "environment": {"type": "string", "const": "production"},
+                    "feature_exercised": {"type": "string"},
+                    "target": {
+                        "type": "string",
+                        "enum": [
+                            "AJ test client",
+                            "production public surface",
+                            "+1 818-447-8271",
+                            "aj@scalesystem.ai",
+                        ],
+                    },
+                    "external_action": {"type": "boolean"},
+                },
+                "required": [
+                    "checked",
+                    "environment",
+                    "feature_exercised",
+                    "target",
+                    "external_action",
+                ],
                 "additionalProperties": False,
             },
             "result": {

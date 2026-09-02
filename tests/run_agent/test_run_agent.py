@@ -894,6 +894,9 @@ class TestBuildSystemPrompt:
         assert "# Anti-overcomplication check" in prompt
         assert "security theatre" in prompt
         assert "anti_overcomplication" in prompt
+        assert "# Real production E2E" in prompt
+        assert "+1 818-447-8271" in prompt
+        assert "aj@scalesystem.ai" in prompt
 
     def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
         with (
