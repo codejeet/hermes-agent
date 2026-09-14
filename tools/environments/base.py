@@ -602,15 +602,23 @@ class BaseEnvironment(ABC):
         return ()
 
     def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
-        """Return profile-scoped names that must not persist in the snapshot.
+        """Return runtime identity and profile names excluded from snapshots.
 
-        The set is monotonic for the environment lifetime. A skill/config
+        Delegation lineage and dispatcher claims belong to the current call,
+        not the shared shell. Exclude them from both dumps and restore their
+        freshly injected values after sourcing even an old poisoned snapshot.
+        Real child calls retain their marker; parent calls retain their claim.
+
+        The profile set is monotonic for the environment lifetime. A skill/config
         allowlist can be cleared after a value was captured; retaining the
         exclusion prevents that old value from becoming visible to a later
         profile through the shared snapshot.
         """
+        from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
+        runtime_names = (DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS)
         if not self._profile_scoped_passthrough:
-            return ()
+            return runtime_names
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():
@@ -629,7 +637,7 @@ class BaseEnvironment(ABC):
                 "Could not refresh profile-scoped snapshot exclusions",
                 exc_info=True,
             )
-        return tuple(sorted(self._snapshot_passthrough_names))
+        return tuple(sorted(self._snapshot_passthrough_names | set(runtime_names)))
 
     def init_session(self):
         """Capture login shell environment into a snapshot file.
