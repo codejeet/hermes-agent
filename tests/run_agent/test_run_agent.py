@@ -2781,6 +2781,8 @@ class TestRunConversation:
         assert result["completed"] is True
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
+        from agent.outcome_judgment import OUTCOME_FIRST_GUIDANCE
+
         self._setup_agent(agent)
         agent._cached_system_prompt = "stable instructions\n\nsession context"
         agent._cached_system_prompt_static = "stable instructions"
@@ -2810,7 +2812,7 @@ class TestRunConversation:
             },
             {
                 "type": "text",
-                "text": "\n\nsession context",
+                "text": "\n\nsession context\n\n" + OUTCOME_FIRST_GUIDANCE.strip(),
                 "cache_control": {"type": "ephemeral"},
             },
         ]

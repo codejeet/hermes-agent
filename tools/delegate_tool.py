@@ -824,7 +824,12 @@ def _build_child_system_prompt(
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
-        "When finished, provide a clear, concise summary of:\n"
+        "When the task asks for copy, an explanation or another finished artifact, "
+        "return the requested deliverable itself, not just a report about writing it. "
+        "Keep internal research limits and implementation notes separate from "
+        "customer-facing deliverables; include only material qualifications in the artifact. "
+        "Preserve the audience, purpose and constraints given in the task.\n\n"
+        "For operational work, or alongside an artifact when useful, provide a concise summary of:\n"
         "- What you did\n"
         "- What you found or accomplished\n"
         "- Any files you created or modified\n"

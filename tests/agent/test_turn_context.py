@@ -205,7 +205,8 @@ def test_returns_turn_context_with_user_message_appended():
     # The user turn was appended and indexed.
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
-    assert ctx.active_system_prompt == "SYSTEM"
+    from agent.outcome_judgment import OUTCOME_FIRST_GUIDANCE
+    assert ctx.active_system_prompt == "SYSTEM\n\n" + OUTCOME_FIRST_GUIDANCE.strip()
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
@@ -337,8 +338,9 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     _build(agent, restore_or_build_system_prompt=_restore)
 
     # The prompt was populated before the DB row was created.
-    assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
-    assert agent._cached_system_prompt == "REBUILT-SYSTEM"
+    from agent.outcome_judgment import OUTCOME_FIRST_GUIDANCE
+    assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM\n\n" + OUTCOME_FIRST_GUIDANCE.strip()
+    assert agent._cached_system_prompt == agent._ensure_db_prompt_at_call
 
 
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────

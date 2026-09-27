@@ -31,6 +31,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.kanban_guardrails import append_kanban_guardrails
+from agent.outcome_judgment import OUTCOME_FIRST_GUIDANCE
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -200,6 +201,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Delivery judgment is not a tool protocol or persona. It must also reach
+    # isolated delegates and tool-less turns that deliberately skip SOUL/context.
+    # Static text in the stable tier preserves caching and survives rebuilds.
+    stable_parts.append(OUTCOME_FIRST_GUIDANCE)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)

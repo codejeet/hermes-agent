@@ -615,6 +615,11 @@ def build_turn_context(
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
+    # Existing DB snapshots predate new core guidance. Upgrade once at a turn
+    # boundary, preserving the old prefix rather than rebuilding all context.
+    from agent.outcome_judgment import ensure_cached_outcome_guidance
+    ensure_cached_outcome_guidance(agent)
+
     active_system_prompt = agent._cached_system_prompt
 
     # Create the DB session row now that _cached_system_prompt is populated, so
