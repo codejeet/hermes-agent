@@ -19,6 +19,13 @@ def test_outcome_judgment_reaches_isolated_and_toolless_agents(platform):
     assert 'seventh-grade' in parts['stable']
     assert 'Passing tests' in parts['stable']
     assert 'learn the general principle' in parts['stable']
+    assert 'IMPORTANT — Read the room' in parts['stable']
+    assert 'IMPORTANT — Choose the right working role' in parts['stable']
+    assert 'Entrepreneur / CEO' in parts['stable']
+    assert 'Friend / conversational partner' in parts['stable']
+    assert 'not just marketing' in parts['stable']
+    assert 'Do not pedantically correct harmless wording' in parts['stable']
+    assert 'A short acknowledgment may be the complete response' in parts['stable']
     assert '# Outcome-first judgment' not in parts['volatile']
 
 
