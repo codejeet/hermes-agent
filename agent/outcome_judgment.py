@@ -66,6 +66,19 @@ or narrow workflow and declare the underlying problem solved. When delegating,
 carry the audience, intended outcome and relevant constraints into the handoff;
 judge the returned artifact against that purpose, not just the child's report.
 
+### Judgment examples from AJ's corrections — not response templates
+
+- SEO copy: replacing technical nouns with simpler synonyms does not fix a staff
+  handbook masquerading as a sales page. Rebuild the angle around the buyer's
+  payoff and natural search language; do not make the buyer evaluate our research.
+- Explaining a repeated failure: reporting prompt edits and passing tests is not
+  evidence of understanding. Name the mistaken judgment, apply the correction to
+  the whole relevant artifact, and show what actually improved.
+- Business requests: a neutral options inventory leaves the decision with AJ.
+  Identify the decisive constraint, recommend a move, and take the next authorized
+  step. Uncertainty matters when it could change that move, not merely because it
+  exists. Do not invent facts or hide a material downside to sound decisive.
+
 Before delivery, inspect the actual result as its intended reader or user. Does
 it achieve their goal? Remove anything that weakens it without serving a concrete
 need. Passing tests, changing a prompt, completing a checklist or producing a
@@ -78,18 +91,49 @@ ordinary execution, not a new reviewer, approval gate, scoring system or paperwo
 """
 
 
-def ensure_cached_outcome_guidance(agent) -> bool:
-    """Upgrade a pre-existing prompt once, without rewriting its cached prefix.
+def _refresh_owned_guidance(prompt: str, *, append_if_missing: bool = True) -> str:
+    """Replace only our complete, signature-delimited block; retain other text.
 
-    Called at the user-turn boundary after restore, never in the model retry or
-    tool loop. Fresh prompts already include this block. Existing conversations
-    keep their identity, context and history; only the missing block is appended.
+    The start and final sentence have been stable since the first version.
+    Heading-only matches are deliberately insufficient: caller/user sections
+    with the same title must survive. No model call or per-turn classifier.
+    """
+    import re
+
+    pattern = (
+        r"(?ms)^# Outcome-first judgment\n\nAchieve the user's intended result,"
+        r".*?^ordinary execution, not a new reviewer, approval gate, scoring system or paperwork\."
+    )
+    matches = list(re.finditer(pattern, prompt))
+    guidance = OUTCOME_FIRST_GUIDANCE.strip()
+    if not matches:
+        return prompt + '\n\n' + guidance if append_if_missing else prompt
+    for index in reversed(range(len(matches))):
+        match = matches[index]
+        replacement = guidance if index == 0 else ''
+        prompt = prompt[:match.start()] + replacement + prompt[match.end():]
+    return prompt
+
+
+def ensure_cached_outcome_guidance(agent) -> bool:
+    """Refresh at the user-turn boundary, replacing old policy rather than stacking it.
+
+    History and unrelated instructions survive. The cache prefix changes only
+    when the owned policy changes, then stays stable on subsequent turns.
     """
     prompt = getattr(agent, "_cached_system_prompt", None)
-    guidance = OUTCOME_FIRST_GUIDANCE.strip()
-    if not isinstance(prompt, str) or not prompt or guidance in prompt:
+    if not isinstance(prompt, str) or not prompt:
         return False
-    agent._cached_system_prompt = prompt + "\n\n" + guidance
+    updated = _refresh_owned_guidance(prompt)
+    if updated == prompt:
+        return False
+    static = getattr(agent, '_cached_system_prompt_static', None)
+    if isinstance(static, str) and prompt.startswith(static):
+        refreshed_static = _refresh_owned_guidance(static, append_if_missing=False)
+        # A partial block can straddle a legacy cache boundary. Drop that cache
+        # hint rather than claim a prefix that no longer matches the full text.
+        agent._cached_system_prompt_static = refreshed_static if updated.startswith(refreshed_static) else ''
+    agent._cached_system_prompt = updated
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if db is not None and session_id:

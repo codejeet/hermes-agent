@@ -81,6 +81,39 @@ def test_new_prompt_needs_no_upgrade():
     db.update_system_prompt.assert_not_called()
 
 
+def test_old_guidance_is_replaced_and_duplicates_removed_without_losing_context():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from agent.outcome_judgment import ensure_cached_outcome_guidance, OUTCOME_FIRST_GUIDANCE
+
+    current = OUTCOME_FIRST_GUIDANCE.strip()
+    legacy = current.replace('positive sales bias', 'legacy framing')
+    prefix = 'Original identity\n\n'
+    suffix = '\n\nOriginal workspace and user instructions'
+    db = MagicMock()
+    agent = SimpleNamespace(_cached_system_prompt=prefix + legacy + suffix + '\n\n' + current,
+                            _cached_system_prompt_static=prefix + legacy,
+                            _session_db=db, session_id='existing')
+    assert ensure_cached_outcome_guidance(agent) is True
+    assert agent._cached_system_prompt.count('# Outcome-first judgment') == 1
+    assert 'legacy framing' not in agent._cached_system_prompt
+    assert suffix in agent._cached_system_prompt
+    assert agent._cached_system_prompt.startswith(agent._cached_system_prompt_static)
+    assert agent._cached_system_prompt_static == prefix + current
+    assert ensure_cached_outcome_guidance(agent) is False
+    assert db.update_system_prompt.call_count == 1
+
+
+def test_unrelated_similarly_named_section_is_preserved():
+    from types import SimpleNamespace
+    from agent.outcome_judgment import ensure_cached_outcome_guidance
+
+    unrelated = '# Outcome-first judgment\n\nUser-authored notes without our block signature.'
+    agent = SimpleNamespace(_cached_system_prompt=unrelated)
+    assert ensure_cached_outcome_guidance(agent) is True
+    assert agent._cached_system_prompt.startswith(unrelated)
+
+
 def test_cache_write_failure_does_not_drop_instruction_or_break_turn(caplog):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
