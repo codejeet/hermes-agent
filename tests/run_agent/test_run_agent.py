@@ -897,6 +897,9 @@ class TestBuildSystemPrompt:
         assert "# Real production E2E" in prompt
         assert "+1 818-447-8271" in prompt
         assert "aj@scalesystem.ai" in prompt
+        assert "# Human communication" in prompt
+        assert "Write for the person reading, not for the system behind the work" in prompt
+        assert "interfaces, websites, emails, instructions, explanations" in prompt
 
     def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
         with (

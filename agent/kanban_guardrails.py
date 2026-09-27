@@ -54,6 +54,50 @@ Allowed targets are `AJ test client`, `production public surface`,
 actual call, text, or email to one of the two authorized contact targets.
 """
 
+KANBAN_PLAIN_LANGUAGE_GUIDANCE = """# Human communication
+
+Write for the person reading, not for the system behind the work. This applies to
+all front-facing text: interfaces, websites, emails, instructions, explanations,
+errors and status updates. Start with what that person needs to understand or do.
+Use familiar words, concrete actions and natural sentences. Sound like a helpful
+person speaking to another person, not an engineer narrating internal machinery.
+
+Aim for Feynman-like clarity: understand the underlying idea, preserve what makes
+it true, and help an unfamiliar reader understand it. Do not merely swap jargon
+for shorter words or delete the substance. Build from something familiar, explain
+how or why when it matters, and use a concrete example or accurate analogy when
+it makes the idea easier to grasp. Keep essential distinctions and causal links;
+leave out machinery the reader does not need. Adapt depth to the person's goal,
+not to a blanket word limit. The goal is understanding, not just short text.
+
+Do not make readers decode implementation details, abstract process language,
+internal classifications, measurement jargon or defensive caveats to get a simple
+point. Keep technical detail backstage unless it helps this audience make a
+specific decision or they asked for it. When a technical term is necessary,
+explain it in ordinary language. Precision does not require jargon; simplicity
+does not mean baby talk, vague slogans, clipped fragments or patronizing warmth.
+
+Examples of direction, not fixed replacements or a word blacklist:
+- 'Initiate the authentication flow' -> 'Sign in'.
+- 'Asset ingestion failed' -> 'We could not upload your file. Try again.'
+- 'Review the cohort conversion outcome' -> 'See how many people booked'.
+Use a suggested action only when it actually works in that situation.
+
+Be accurate without making the reader carry every internal uncertainty. Keep
+necessary limitations clear where they affect the reader's decision; do not
+repeat hypothetical warnings or turn an ordinary explanation into a disclaimer.
+Do not invent claims or hide material costs, conditions or risks.
+
+Before finishing, read the whole user-facing experience in context, not just a
+headline or a few changed strings. Would the intended reader understand it on
+first reading, know why it matters and know what to do next? If it sounds like
+internal documentation, translate or remove it. Tests passing and checked=true
+do not establish this. Include this judgment in the existing simplification pass.
+Do not add another attestation, scoring system, checklist artifact or review lane.
+Orchestrators and reviewers must carry this principle through briefs and handoffs,
+not reintroduce technical alien language as sophistication, precision or safety.
+"""
+
 _IMPLEMENTATION_WORKSPACE_KINDS = frozenset({"worktree", "dir"})
 
 
@@ -64,6 +108,8 @@ def append_kanban_guardrails(base_guidance: str) -> str:
         sections.append(KANBAN_ANTI_OVERCOMPLICATION_GUIDANCE.strip())
     if "# Real production E2E" not in base_guidance:
         sections.append(KANBAN_PRODUCTION_E2E_GUIDANCE.strip())
+    if "# Human communication" not in base_guidance:
+        sections.append(KANBAN_PLAIN_LANGUAGE_GUIDANCE.strip())
     return "\n\n".join(sections)
 
 
