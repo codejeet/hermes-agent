@@ -40,9 +40,18 @@ assertion, preview environment, or synthetic substitute does not close productio
 
 Use the AJ test client and create or update clearly labeled production test objects as
 needed. Those test objects may remain; cleanup is not an acceptance gate. If the
-feature calls, texts, or emails, the only authorized real targets are
-`+1 818-447-8271` or `aj@scalesystem.ai`. Never contact any other client or lead.
-Use one authorized target unless the feature itself requires both channels, and verify
+feature calls, texts, or emails, the default authorized contact targets are
+`+1 818-447-8271` or `aj@scalesystem.ai`. Real handset calls are allowed.
+For AJ's explicitly authorized owned-number telephony tests, real calls BETWEEN
+our existing Twilio numbers are also allowed. Verify ownership and the exact
+source/destination allowlist, inspect forwarding, prevent loops, and keep calls
+short, low-volume, monitored, and cleaned up. This is not permission to contact
+customers, ring uncontrolled staff devices, buy numbers, or expand spending.
+Never contact any other client or lead. An already-approved task-specific test
+scope is not a new permission request; do not invent a handset-call ban or a
+mandatory answer-window gate. Human answered-call evidence still requires an
+actual human answer; voicemail does not prove the opening exchange.
+Use the authorized targets needed for the feature, and verify
 the authoritative application/provider outcome rather than only a click or request.
 
 Before `kanban_complete` on a production-deploy card, pass:
@@ -50,8 +59,11 @@ Before `kanban_complete` on a production-deploy card, pass:
 "feature_exercised": "what actually ran", "target": "AJ test client",
 "external_action": false}`.
 Allowed targets are `AJ test client`, `production public surface`,
-`+1 818-447-8271`, and `aj@scalesystem.ai`. Set `external_action=true` only for an
-actual call, text, or email to one of the two authorized contact targets.
+`+1 818-447-8271`, `aj@scalesystem.ai`, and `AJ-authorized owned Twilio numbers`.
+Use the owned-number label only for the explicitly authorized scope above and
+identify the verified endpoints and actual call results in the handoff.
+Set `external_action=true` for actual calls, texts, or emails to an authorized
+contact target, including real owned-number calls; never label those mock-only.
 """
 
 KANBAN_PLAIN_LANGUAGE_GUIDANCE = """# Human communication
@@ -175,9 +187,10 @@ _PRODUCTION_E2E_TARGETS = frozenset(
         "production public surface",
         "+1 818-447-8271",
         "aj@scalesystem.ai",
+        "AJ-authorized owned Twilio numbers",
     }
 )
-_EXTERNAL_E2E_TARGETS = frozenset({"+1 818-447-8271", "aj@scalesystem.ai"})
+_EXTERNAL_E2E_TARGETS = frozenset({"+1 818-447-8271", "aj@scalesystem.ai", "AJ-authorized owned Twilio numbers"})
 
 
 def normalize_production_e2e(value: Any) -> dict[str, Any]:
@@ -196,7 +209,7 @@ def normalize_production_e2e(value: Any) -> dict[str, Any]:
     if target not in _PRODUCTION_E2E_TARGETS:
         raise ValueError(
             "production_e2e.target must be AJ test client, production public surface, "
-            "+1 818-447-8271, or aj@scalesystem.ai"
+            "+1 818-447-8271, aj@scalesystem.ai, or AJ-authorized owned Twilio numbers"
         )
     external_action = value.get("external_action")
     if not isinstance(external_action, bool):

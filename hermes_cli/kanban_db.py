@@ -4921,8 +4921,9 @@ def complete_task(
                 raise ProductionE2ERequiredError(
                     "Production deployment completion blocked: exercise the actual "
                     "feature in real production using only the AJ test client, "
-                    "+1 818-447-8271, aj@scalesystem.ai, or the production public "
-                    "surface; then include metadata.production_e2e."
+                    "+1 818-447-8271, aj@scalesystem.ai, the production public "
+                    "surface, or AJ-authorized owned Twilio numbers within their "
+                    "explicit task scope; then include metadata.production_e2e."
                 ) from exc
             metadata = dict(metadata or {})
             metadata["production_e2e"] = production_e2e

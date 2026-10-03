@@ -764,7 +764,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     "feature in production, then retry with production_e2e={checked: "
                     "true, environment: production, feature_exercised: ..., target: "
                     "AJ test client|production public surface|+1 818-447-8271|"
-                    "aj@scalesystem.ai, external_action: true|false}. Never contact "
+                    "aj@scalesystem.ai|AJ-authorized owned Twilio numbers, "
+                    "external_action: true|false}. Never contact "
                     "any non-AJ client."
                 )
             if task and task.goal_mode and _goal_judge_available():
@@ -1742,7 +1743,10 @@ KANBAN_COMPLETE_SCHEMA = {
                     "the actual live feature, not a mock/preview/provider-disabled "
                     "substitute. Production test objects may remain. Use only the AJ "
                     "test client, production public surface, +1 818-447-8271, or "
-                    "aj@scalesystem.ai; never contact another client."
+                    "aj@scalesystem.ai, or AJ-authorized owned Twilio numbers "
+                    "within the explicit task-specific call scope; verify ownership "
+                    "and routing first. Real handset calls are allowed. Never "
+                    "contact another client."
                 ),
                 "properties": {
                     "checked": {"type": "boolean", "const": True},
@@ -1755,6 +1759,7 @@ KANBAN_COMPLETE_SCHEMA = {
                             "production public surface",
                             "+1 818-447-8271",
                             "aj@scalesystem.ai",
+                            "AJ-authorized owned Twilio numbers",
                         ],
                     },
                     "external_action": {"type": "boolean"},
