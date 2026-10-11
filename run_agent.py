@@ -7485,13 +7485,17 @@ class AIAgent:
                     return system_message or ""
 
             def _on_timeout(idle, waited, since_progress):
+                timeout_reason = (
+                    "total time limit" if waited >= total_ceiling else "inactivity limit"
+                )
                 logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
+                    "Context compression timed out: %s "
+                    "(total wait %.1fs, ceiling %.1fs, last progress %.1fs ago); continuing without "
                     "compression",
-                    since_progress,
+                    timeout_reason,
                     waited,
                     total_ceiling,
+                    since_progress,
                 )
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
@@ -7514,7 +7518,7 @@ class AIAgent:
                         try:
                             record(
                                 "host compress_context timeout "
-                                "(no summary progress)"
+                                f"({timeout_reason})"
                             )
                         except Exception:
                             logger.debug(
@@ -7524,10 +7528,20 @@ class AIAgent:
                             )
                 emit = getattr(self, "_emit_warning", None)
                 if callable(emit):
+                    if timeout_reason == "total time limit":
+                        timing = (
+                            f"after {waited:.1f}s total "
+                            f"(total time limit {total_ceiling:.1f}s; "
+                            f"last progress {since_progress:.1f}s ago). "
+                        )
+                    else:
+                        timing = (
+                            f"after {since_progress:.1f}s without progress "
+                            f"({waited:.1f}s total). "
+                        )
                     emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
+                        "⚠ Context compression timed out " + timing
+                        + "No messages were dropped — continuing without "
                         "compression. Run /compress to retry, /new for a clean "
                         "session, or check auxiliary.compression."
                     )

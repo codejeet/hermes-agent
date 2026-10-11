@@ -2596,6 +2596,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
 
+        # CPython's sqlite wrapper can surface this exact SystemError when a
+        # check_same_thread=False connection is hit by a rare cross-thread C
+        # API race.  It is not a disk/full/permission error and the same
+        # connection remains usable.  Recovery below is transaction-state
+        # aware so a commit that actually landed is never replayed.
+        def _is_null_without_exception(exc: BaseException) -> bool:
+            return (
+                isinstance(exc, SystemError)
+                and "returned null without setting an exception"
+                in str(exc).lower()
+            )
+
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
         # lock). The identical write succeeds standalone, so it is
@@ -2606,7 +2618,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        operation = getattr(
+            fn, "__qualname__", getattr(fn, "__name__", type(fn).__name__)
+        )
+
+        def _finish_success(result, acquired_at: float, finished_at: float):
+            lock_wait_s = acquired_at - write_started
+            transaction_s = finished_at - acquired_at
+            if lock_wait_s >= self._WRITE_WAIT_WARN_AFTER_S:
+                logger.warning(
+                    "state.db write lock wait recovered: elapsed=%.3fs "
+                    "retries=%d patience=%.1fs operation=%s db=%s",
+                    lock_wait_s,
+                    lock_retries,
+                    patience_s,
+                    operation,
+                    self.db_path,
+                )
+            if transaction_s >= self._WRITE_TXN_WARN_AFTER_S:
+                logger.warning(
+                    "state.db write transaction slow: elapsed=%.3fs "
+                    "lock_wait=%.3fs operation=%s db=%s",
+                    transaction_s,
+                    lock_wait_s,
+                    operation,
+                    self.db_path,
+                )
+            self._write_count += 1
+            if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                self._try_wal_checkpoint()
+            if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                self._try_incremental_merge_fts()
+            return result
+
+        _NO_RESULT = object()
         while True:
+            phase = "begin"
+            result = _NO_RESULT
             try:
                 lock_acquired_at: Optional[float] = None
                 transaction_finished_at: Optional[float] = None
@@ -2614,9 +2662,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._conn.execute("BEGIN IMMEDIATE")
                     lock_acquired_at = time.monotonic()
                     try:
+                        phase = "body"
                         result = fn(self._conn)
+                        phase = "commit"
                         self._conn.commit()
                         transaction_finished_at = time.monotonic()
+                        phase = "done"
                     except BaseException:
                         try:
                             self._conn.rollback()
@@ -2625,37 +2676,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         raise
                 assert lock_acquired_at is not None
                 assert transaction_finished_at is not None
-                lock_wait_s = lock_acquired_at - write_started
-                transaction_s = transaction_finished_at - lock_acquired_at
-                operation = getattr(
-                    fn, "__qualname__", getattr(fn, "__name__", type(fn).__name__)
+                return _finish_success(
+                    result, lock_acquired_at, transaction_finished_at
                 )
-                if lock_wait_s >= self._WRITE_WAIT_WARN_AFTER_S:
-                    logger.warning(
-                        "state.db write lock wait recovered: elapsed=%.3fs "
-                        "retries=%d patience=%.1fs operation=%s db=%s",
-                        lock_wait_s,
-                        lock_retries,
-                        patience_s,
-                        operation,
-                        self.db_path,
-                    )
-                if transaction_s >= self._WRITE_TXN_WARN_AFTER_S:
-                    logger.warning(
-                        "state.db write transaction slow: elapsed=%.3fs "
-                        "lock_wait=%.3fs operation=%s db=%s",
-                        transaction_s,
-                        lock_wait_s,
-                        operation,
-                        self.db_path,
-                    )
-                # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
-                return result
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor
                 # publishes in a couple of seconds. Without any wait, a steer
@@ -2718,6 +2741,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    continue
+                raise
+            except SystemError as exc:
+                if not _is_null_without_exception(exc):
+                    raise
+                # The wrapper error can arrive from BEGIN/body/COMMIT.  The
+                # inner handler already attempted rollback for body/commit
+                # failures, but inspect the authoritative SQLite transaction
+                # bit under the connection lock before deciding whether a
+                # replay is safe.
+                with self._lock:
+                    in_transaction = bool(
+                        self._conn is not None and self._conn.in_transaction
+                    )
+                    if in_transaction:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+
+                if (
+                    phase == "commit"
+                    and not in_transaction
+                    and result is not _NO_RESULT
+                    and lock_acquired_at is not None
+                ):
+                    logger.warning(
+                        "state.db SQLite wrapper returned NULL after COMMIT, "
+                        "but the transaction is complete; accepting the write "
+                        "without replay to avoid duplicate transcript rows "
+                        "(operation=%s db=%s)",
+                        operation,
+                        self.db_path,
+                    )
+                    return _finish_success(
+                        result, lock_acquired_at, time.monotonic()
+                    )
+
+                lock_retries += 1
+                logger.warning(
+                    "state.db transient SQLite wrapper race during %s; "
+                    "transaction rolled back/not started, retrying safely "
+                    "(operation=%s db=%s)",
+                    phase,
+                    operation,
+                    self.db_path,
+                )
+                if self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
 

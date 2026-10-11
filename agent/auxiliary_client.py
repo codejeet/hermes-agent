@@ -383,6 +383,28 @@ def _notify_aux_progress() -> None:
         logger.debug("aux progress hook failed", exc_info=True)
 
 
+def _stream_delta_has_progress(event: Any) -> bool:
+    """Whether a provider stream event contains usable generated output.
+
+    Response-started, ping, usage, and empty delta frames prove only that the
+    transport is alive. Counting them as model progress kept compression's
+    idle watchdog at 0 seconds while no summary was being produced.
+    """
+    event_type = str(_obj_get(event, "type", "") or "").casefold()
+    if "delta" not in event_type:
+        return False
+    delta = _obj_get(event, "delta", None)
+    if isinstance(delta, str):
+        return bool(delta)
+    if delta is None:
+        return False
+    for key in ("text", "thinking", "partial_json", "arguments"):
+        value = _obj_get(delta, key, None)
+        if isinstance(value, str) and value:
+            return True
+    return False
+
+
 def _aux_progress_active() -> bool:
     return getattr(_aux_progress, "hook", None) is not None
 
@@ -1463,10 +1485,10 @@ class _CodexCompletionsAdapter:
             def _on_each_event(_event: Any) -> None:
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
-                # Each SSE event is also forward progress for hosts watching
-                # a progress hook (gateway session hygiene): a reasoning
-                # model streaming a long summary must not look hung.
-                _notify_aux_progress()
+                # Empty/ping/lifecycle frames must not keep a wedged summary
+                # alive. Only generated output extends the inactivity budget.
+                if _stream_delta_has_progress(_event):
+                    _notify_aux_progress()
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -1772,7 +1794,11 @@ class _AnthropicCompletionsAdapter:
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
             on_stream_event=(
-                (lambda _event: _notify_aux_progress())
+                (lambda _event: (
+                    _notify_aux_progress()
+                    if _stream_delta_has_progress(_event)
+                    else None
+                ))
                 if _aux_progress_active() else None
             ),
         )
@@ -8304,7 +8330,6 @@ def _create_with_progress(
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_progress()  # request dispatched counts as progress
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
         return client.chat.completions.create(**kwargs)
 
@@ -8396,7 +8421,6 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -8418,15 +8442,18 @@ class _ChatStreamAccumulator:
         delta = getattr(choice, "delta", None)
         if delta is None:
             return
+        meaningful_delta = False
         piece = getattr(delta, "content", None)
         if piece:
             self.content_parts.append(piece)
+            meaningful_delta = True
         reasoning_piece = (
             getattr(delta, "reasoning", None)
             or getattr(delta, "reasoning_content", None)
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
+            meaningful_delta = True
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
@@ -8434,12 +8461,17 @@ class _ChatStreamAccumulator:
             )
             if getattr(tc, "id", None):
                 acc["id"] = tc.id
+                meaningful_delta = True
             fn = getattr(tc, "function", None)
             if fn is not None:
                 if getattr(fn, "name", None):
                     acc["name"] = fn.name
+                    meaningful_delta = True
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+                    meaningful_delta = True
+        if meaningful_delta:
+            _notify_aux_progress()
 
     def finish(self) -> Any:
         tool_calls = None

@@ -790,7 +790,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "ssh", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:
@@ -800,7 +800,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         import tools.terminal_tool as tt
 
         # Path only exists on the remote backend; locally it is absent, so the
-        # guard must fall back to env.execute('cat ...') to scan it.
+        # guard must use a bounded read through the remote environment.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -809,7 +809,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "cat" in command and "/remote/workspace/remote.sh" in command:
+                if "head -c" in command and "/remote/workspace/remote.sh" in command:
                     return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
@@ -821,7 +821,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
-        assert any("cat" in c for c in calls)
+        assert any("head -c" in c for c in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:

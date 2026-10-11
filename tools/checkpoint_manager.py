@@ -147,6 +147,10 @@ _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
 
+# Global size maintenance may be unable to satisfy the cap while preserving
+# one snapshot per project. Do not repeat that work on every file edit.
+_SIZE_CAP_RETRY_SECONDS = 300
+
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 
@@ -713,8 +717,8 @@ class CheckpointManager:
     max_snapshots : int
         Keep at most this many checkpoints per directory.
     max_total_size_mb : int
-        Hard ceiling on total store size.  Oldest checkpoints per project
-        are dropped when the store exceeds this after a commit.
+        Target total store size. Rate-limited maintenance drops oldest
+        checkpoints after a commit, retaining at least one per project.
     max_file_size_mb : int
         Skip adding any single file larger than this to a checkpoint.
         (Implemented via ``.gitignore`` excludes + a post-stage size check.)
@@ -733,6 +737,7 @@ class CheckpointManager:
         self.max_file_size_mb = max(0, int(max_file_size_mb))
         self._checkpointed_dirs: Set[str] = set()
         self._git_available: Optional[bool] = None  # lazy probe
+        self._size_cap_retry_at = 0.0
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -1244,14 +1249,19 @@ class CheckpointManager:
 
     def _enforce_size_cap(self, store: Path) -> None:
         """If total store size exceeds ``max_total_size_mb``, drop oldest
-        checkpoints across ALL projects until under the cap.
+        checkpoints across ALL projects until under the cap or at the
+        retained minimum. Throttle maintenance, not snapshot creation.
         """
         if self.max_total_size_mb <= 0:
+            return
+        now = time.monotonic()
+        if now < self._size_cap_retry_at:
             return
         cap_bytes = self.max_total_size_mb * 1024 * 1024
         size = _dir_size_bytes(store)
         if size <= cap_bytes:
             return
+        self._size_cap_retry_at = now + _SIZE_CAP_RETRY_SECONDS
         logger.info(
             "Checkpoint store exceeded %d MB (actual %d MB) — pruning oldest",
             self.max_total_size_mb, size // (1024 * 1024),
@@ -1267,9 +1277,10 @@ class CheckpointManager:
             return
         refs = [r for r in stdout.splitlines() if r.strip()]
 
-        any_dropped = False
+        dropped_history = False
         # Round-robin-drop oldest commit per ref until under cap.
         for _ in range(20):  # hard upper bound to avoid pathological loops
+            any_dropped = False
             size = _dir_size_bytes(store)
             if size <= cap_bytes:
                 break
@@ -1315,10 +1326,17 @@ class CheckpointManager:
                     new_parent = new_sha
                 if fail or new_parent is None:
                     continue
-                _run_git(["update-ref", ref, new_parent], store, str(store.parent))
-                any_dropped = True
+                ok_update, _, _ = _run_git(
+                    ["update-ref", ref, new_parent], store, str(store.parent),
+                )
+                if ok_update:
+                    any_dropped = True
+                    dropped_history = True
             if not any_dropped:
                 break
+
+        if not dropped_history:
+            return
 
         _run_git(
             ["reflog", "expire", "--expire=now", "--all"],

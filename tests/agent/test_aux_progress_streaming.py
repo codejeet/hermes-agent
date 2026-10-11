@@ -22,6 +22,7 @@ from agent.auxiliary_client import (
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
+    _stream_delta_has_progress,
     aux_progress_hook,
 )
 from agent.conversation_compression import CompressionCommitFence
@@ -131,8 +132,41 @@ class TestCreateWithProgress:
         assert result.choices[0].message.reasoning == "thinking..."
         assert result.choices[0].finish_reason == "stop"
         assert result.usage.total_tokens == 7
-        # 1 dispatch tick + 1 per chunk
-        assert len(ticks) >= len(chunks) + 1
+        # Only chunks carrying generated reasoning/content count as progress.
+        assert len(ticks) == len(chunks)
+
+    def test_empty_stream_frames_do_not_reset_progress(self):
+        chunks = [
+            SimpleNamespace(id="r1", model="m1", choices=[], usage=None),
+            _chunk(content=None),
+            _chunk(content="done", finish_reason="stop"),
+        ]
+        client = _FakeClient(stream_chunks=chunks)
+        ticks = []
+        with aux_progress_hook(lambda: ticks.append(1)):
+            result = _create_with_progress(
+                client, {"model": "m1", "messages": [], "timeout": 30},
+            )
+        assert result.choices[0].message.content == "done"
+        assert ticks == [1]
+
+
+class TestProviderEventProgress:
+    @pytest.mark.parametrize(
+        ("event", "expected"),
+        [
+            ({"type": "response.created"}, False),
+            ({"type": "ping"}, False),
+            ({"type": "response.output_text.delta", "delta": ""}, False),
+            ({"type": "response.output_text.delta", "delta": "token"}, True),
+            ({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "token"},
+            }, True),
+        ],
+    )
+    def test_only_generated_deltas_count(self, event, expected):
+        assert _stream_delta_has_progress(event) is expected
 
     def test_streaming_rejected_falls_back_to_plain_call(self):
         client = _FakeClient(

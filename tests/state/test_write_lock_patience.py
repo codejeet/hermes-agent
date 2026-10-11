@@ -165,6 +165,74 @@ class TestTranscriptWritePatience:
         assert "lock_wait=" in message
         assert str(db.db_path) in message
 
+    def test_null_without_exception_in_body_rolls_back_and_retries(self, db):
+        """The rare CPython sqlite wrapper race must not abort a transcript."""
+        attempts = 0
+
+        def flaky_write(conn):
+            nonlocal attempts
+            attempts += 1
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                ("null-race-body", str(attempts)),
+            )
+            if attempts == 1:
+                raise SystemError(
+                    "TrackedConnection object returned NULL without setting an exception"
+                )
+            return "written"
+
+        assert db._execute_write(flaky_write, patience_s=2.0) == "written"
+        assert attempts == 2
+        row = db._conn.execute(
+            "SELECT value FROM state_meta WHERE key='null-race-body'"
+        ).fetchone()
+        assert row[0] == "2"
+
+    def test_null_without_exception_after_commit_is_not_replayed(self, db):
+        """An ambiguous wrapper error after a successful COMMIT is accepted once."""
+        real_conn = db._conn
+
+        class CommitErrorAfterSuccess:
+            def __init__(self, inner):
+                self.inner = inner
+                self.raise_once = True
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def commit(self):
+                self.inner.commit()
+                if self.raise_once:
+                    self.raise_once = False
+                    raise SystemError(
+                        "TrackedConnection object returned NULL without setting an exception"
+                    )
+
+        proxy = CommitErrorAfterSuccess(real_conn)
+        db._conn = proxy
+        calls = 0
+
+        def write_once(conn):
+            nonlocal calls
+            calls += 1
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                ("null-race-commit", "1"),
+            )
+            return 17
+
+        try:
+            assert db._execute_write(write_once, patience_s=2.0) == 17
+        finally:
+            db._conn = real_conn
+
+        assert calls == 1
+        count = real_conn.execute(
+            "SELECT COUNT(*) FROM state_meta WHERE key='null-race-commit'"
+        ).fetchone()[0]
+        assert count == 1
+
 
 class TestOpenLockPatience:
     def test_open_survives_multi_second_lock_hold(self, tmp_path):

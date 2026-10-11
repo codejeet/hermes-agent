@@ -40,7 +40,6 @@ import os
 import platform
 import re
 import shlex
-import stat
 import time
 import threading
 import atexit
@@ -2503,6 +2502,7 @@ def terminal_tool(
         # but applies unconditionally (force=True cannot help here).
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
+                _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
             )
@@ -2528,29 +2528,19 @@ def terminal_tool(
             )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to ``env.execute('cat ...')``.
-                """
-                if env is None:
+                """Read an unresolved remote script with byte and time limits."""
+                # The guard already performed the bounded local read. Retrying
+                # it here used to feed entire binary executables to shlex.
+                if env is None or env_type == "local":
                     return None
+                quoted_path = shlex.quote(script_path)
                 try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
-                            data = local_path.read_bytes()
-                            if len(data) <= 1024 * 1024:
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                try:
-                    result = env.execute(f"cat {shlex.quote(script_path)}")
+                    result = env.execute(
+                        f"if [ -f {quoted_path} ]; then "
+                        f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} -- {quoted_path}; "
+                        "else exit 1; fi",
+                        timeout=10,
+                    )
                     if result.get("returncode", -1) == 0:
                         return result.get("output", "")
                 except Exception:

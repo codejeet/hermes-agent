@@ -48,7 +48,7 @@ _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
-    """Return a function-tool dict with a resolvable top-level ``name``.
+    """Return a sanitized function-tool dict with a resolvable ``name``.
 
     Context engines and memory providers expose tool schemas via
     ``get_tool_schemas()``. The expected shape is a bare function schema
@@ -63,9 +63,12 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     with ``tools[N].function: missing field name`` (HTTP 400), so one bad
     schema disables the whole toolset and breaks every turn (#47707).
 
-    This helper normalizes both shapes to the bare function schema and
-    returns ``None`` for anything without a resolvable name, so callers can
-    skip-with-warning rather than appending a nameless tool.
+    This helper normalizes both shapes to the bare function schema, sanitizes
+    late-injected schemas just like registry-owned tools, and returns ``None``
+    for anything without a resolvable name. Context-engine and memory schemas
+    are appended after ``model_tools.get_tool_definitions()`` performs its
+    global sanitization pass, so sanitizing here prevents strict Responses
+    backends from rejecting constructs such as a top-level ``anyOf``.
     """
     if not isinstance(schema, dict):
         return None
@@ -77,7 +80,17 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     name = schema.get("name", "")
     if not name or not isinstance(name, str):
         return None
-    return schema
+
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    wrapped = {"type": "function", "function": schema}
+    sanitized = sanitize_tool_schemas([wrapped])
+    if not sanitized:
+        return None
+    function_schema = sanitized[0].get("function")
+    if not isinstance(function_schema, dict):
+        return None
+    return function_schema
 
 
 def memory_provider_tools_enabled(

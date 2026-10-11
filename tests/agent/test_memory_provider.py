@@ -1088,6 +1088,36 @@ class TestNormalizeToolSchema:
         assert normalize_tool_schema("nope") is None
         assert normalize_tool_schema(None) is None
 
+    def test_dynamic_schema_is_sanitized_before_injection(self):
+        """Late memory/context schemas must satisfy strict Responses backends."""
+        from agent.memory_manager import normalize_tool_schema
+
+        raw = {
+            "name": "llm_map",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "object",
+                        "properties": {"kind": {"type": "string"}},
+                        "anyOf": [{"required": ["kind"]}],
+                    },
+                },
+                "anyOf": [
+                    {"required": ["batch_id"]},
+                    {"required": ["input_path", "prompt", "output_schema"]},
+                ],
+            },
+        }
+
+        out = normalize_tool_schema(raw)
+
+        assert out is not None
+        assert out["parameters"]["type"] == "object"
+        assert "anyOf" not in out["parameters"]
+        assert "anyOf" in out["parameters"]["properties"]["payload"]
+        assert "anyOf" in raw["parameters"]
+
 
 
 class TestMemoryInjectionRejectsMalformedSchema:

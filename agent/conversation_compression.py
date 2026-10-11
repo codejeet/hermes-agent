@@ -62,9 +62,10 @@ import tempfile
 import time
 import uuid
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, ContextManager, Dict, List, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
@@ -1350,6 +1351,7 @@ def _supported_compression_kwargs(
     force: bool,
     memory_context: str,
     progress_callback: Optional[Callable[[], None]] = None,
+    commit_guard: Optional[Callable[[], ContextManager[None]]] = None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1358,13 +1360,15 @@ def _supported_compression_kwargs(
     compatible without catching an internal ``TypeError`` and executing a
     stateful compressor twice.
     """
-    candidates = {
+    candidates: dict[str, Any] = {
         "current_tokens": current_tokens,
         "focus_topic": focus_topic,
         "force": force,
     }
     if callable(progress_callback):
         candidates["progress_callback"] = progress_callback
+    if callable(commit_guard):
+        candidates["commit_guard"] = commit_guard
     if memory_context:
         candidates["memory_context"] = memory_context
     try:
@@ -2685,6 +2689,43 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+    _commit_fence_entered = False
+    _summary_phase_complete = False
+    _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
+
+    @contextmanager
+    def _context_engine_commit_guard():
+        """Admit plugin publication and retain admission through host handoff.
+
+        A context engine may persist a summary/frontier before returning its
+        transcript. Once that publication starts, cancellation must wait for
+        the corresponding SessionDB rewrite, including any remaining engine
+        work. Only the fence is retained here, never a SQLite transaction.
+        """
+        nonlocal _commit_fence_entered
+        if commit_fence is not None and not _commit_fence_entered:
+            if not commit_fence.begin_commit(_hard_cancel_event):
+                raise AuxiliaryExplicitCancellation()
+            _commit_fence_entered = True
+        yield
+
+    def _finish_commit_fence() -> None:
+        nonlocal _commit_fence_entered
+        if _commit_fence_entered:
+            assert commit_fence is not None
+            _commit_fence_entered = False
+            commit_fence.finish_commit()
+
+    class _EngineCancellationEvent:
+        def is_set(self) -> bool:
+            # An admitted plugin publication and its host handoff are one
+            # commit boundary. Defer hard stop for that boundary, while still
+            # cancelling preparation promptly if the host stops waiting.
+            return not _commit_fence_entered and bool(
+                (commit_fence is not None and commit_fence.is_cancelled)
+                or (_hard_cancel_event is not None and _hard_cancel_event.is_set())
+            )
+
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -2767,6 +2808,9 @@ def compress_context(
             progress_callback=(
                 commit_fence.touch_progress if commit_fence is not None else None
             ),
+            commit_guard=(
+                _context_engine_commit_guard if commit_fence is not None else None
+            ),
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(
@@ -2831,7 +2875,6 @@ def compress_context(
         # Incoming-message interrupts and active-turn redirects must not tear an
         # atomic summary in half (#23975). Explicit stop surfaces set a separate
         # Event atomically; never infer cause from the racy message fields.
-        _hard_cancel_event = getattr(agent, "_hard_interrupt_requested", None)
         try:
             # F6: never start expensive summary work for an already-cancelled
             # fence (a stale queued job admitted after host departure).
@@ -2844,14 +2887,18 @@ def compress_context(
                 compressed = messages
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
+                    cancel_event=(
+                        _EngineCancellationEvent()
+                        if "commit_guard" in compress_kwargs else _hard_cancel_event
+                    )
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
                     # session state.
                     if (
-                        _hard_cancel_event is not None
+                        not _commit_fence_entered
+                        and _hard_cancel_event is not None
                         and _hard_cancel_event.is_set()
                     ):
                         raise AuxiliaryExplicitCancellation()
@@ -2861,6 +2908,7 @@ def compress_context(
                     agent.context_compressor._compression_cancelled_check = None
                 except Exception:
                     pass
+        _summary_phase_complete = True
     except AuxiliaryExplicitCancellation:
         try:
             _restore_compressor_attempt_state(
@@ -2903,7 +2951,12 @@ def compress_context(
             started_at=_attempt_started_at,
             commit_status="aborted",
             split_status="aborted",
-            failure_class="explicit_interrupt",
+            failure_class=(
+                "commit_fence_cancelled"
+                if commit_fence is not None and commit_fence.is_cancelled
+                and not (_hard_cancel_event is not None and _hard_cancel_event.is_set())
+                else "explicit_interrupt"
+            ),
         )
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
@@ -2926,10 +2979,17 @@ def compress_context(
         )
         raise
     finally:
-        if _activity_heartbeat is not None:
-            _activity_heartbeat.stop("context compression completed")
+        try:
+            if _activity_heartbeat is not None:
+                _activity_heartbeat.stop("context compression completed")
+        except BaseException:
+            _summary_phase_complete = False
+            _release_lock()
+            raise
+        finally:
+            if not _summary_phase_complete:
+                _finish_commit_fence()
 
-    _commit_fence_entered = False
     try:
         # Capture boundary quality before session-rotation callbacks run. Built-in
         # and plugin lifecycle hooks may reset per-session compressor fields while
@@ -3020,7 +3080,7 @@ def compress_context(
             _release_lock()
             return messages, _existing_sp
 
-        if commit_fence is not None:
+        if commit_fence is not None and not _commit_fence_entered:
             _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
             if not _commit_fence_entered:
                 _restore_compressor_attempt_state(
@@ -3538,8 +3598,7 @@ def compress_context(
         try:
             _release_lock()
         finally:
-            if _commit_fence_entered:
-                commit_fence.finish_commit()
+            _finish_commit_fence()
 
 
 def _compress_context_via_codex_app_server(

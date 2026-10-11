@@ -254,7 +254,7 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+    """Return ``(text, unsafe)``; empty text skips binaries, None is unreadable."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -279,7 +279,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
     # executed by the user is not a referenced *shell script*.
     if b"\x00" in data:
-        return None, False
+        return "", False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
@@ -325,8 +325,17 @@ def _contains_unsafe_gateway_action(
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
+            # Only unresolved paths need the remote backend. An intentionally
+            # skipped local binary returns empty text, not None.
             script_text = read_remote_script(str(script_path))
+            if script_text:
+                if "\x00" in script_text:
+                    continue
+                if (
+                    len(script_text) > _MAX_REFERENCED_SCRIPT_BYTES
+                    or len(script_text.encode("utf-8")) > _MAX_REFERENCED_SCRIPT_BYTES
+                ):
+                    return True
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
