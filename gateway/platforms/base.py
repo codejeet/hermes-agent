@@ -5959,6 +5959,7 @@ class BasePlatformAdapter(ABC):
                 _tts_requested_path = None
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
+                        and not getattr(event, "_hermes_voice_tts_handled", False)
                         and text_content
                         and not media_files
                         and not self._streaming_tts_turn_completed(

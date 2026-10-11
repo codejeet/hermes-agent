@@ -79,6 +79,7 @@ class TurnContext:
 
     # --- turn parameters / config snapshots (read-only in run_sync) -------
     history: Any = None
+    voice_director_config: Optional[dict] = None
     context_prompt: Optional[str] = None
     channel_prompt: Optional[str] = None
     session_id: Optional[str] = None

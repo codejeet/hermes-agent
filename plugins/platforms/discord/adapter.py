@@ -4229,7 +4229,25 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
-    async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
+    async def play_in_voice_channel(
+        self, guild_id: int, audio_path: str, *, is_current: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Serialize spoken clips per guild without blocking the voice receiver."""
+        locks = getattr(self, "_voice_speech_locks", None)
+        if locks is None:
+            locks = self._voice_speech_locks = {}
+        lock = locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            # A queued quick reply can become stale while a job's final plays.
+            if is_current is not None and not is_current():
+                return False
+            return await self._play_in_voice_channel_unlocked(
+                guild_id, audio_path, is_current=is_current,
+            )
+
+    async def _play_in_voice_channel_unlocked(
+        self, guild_id: int, audio_path: str, *, is_current: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         """Play an audio file in the connected voice channel.
 
         When the continuous mixer is installed for this guild, the clip is
@@ -4247,6 +4265,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._cancel_voice_timeout(guild_id)
         try:
             playback_timeout = await self._playback_timeout_for_audio(audio_path)
+            if is_current is not None and not is_current():
+                return False
 
             # ── Mixer path (overlap + ducking) ──────────────────────────────
             mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
@@ -4256,6 +4276,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 except ImportError:
                     from .voice_mixer import decode_to_pcm
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
+                if is_current is not None and not is_current():
+                    return False
                 if pcm:
                     speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
                     mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
@@ -4263,12 +4285,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     # replies (mirrors legacy semantics) but the ambient keeps
                     # playing underneath the whole time.
                     wait_start = time.monotonic()
-                    while mixer.speech_active:
-                        if time.monotonic() - wait_start > playback_timeout:
-                            logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
-                            mixer.stop_speech()
-                            break
-                        await asyncio.sleep(0.05)
+                    try:
+                        while mixer.speech_active:
+                            if is_current is not None and not is_current():
+                                mixer.stop_speech()
+                                return False
+                            if time.monotonic() - wait_start > playback_timeout:
+                                logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
+                                mixer.stop_speech()
+                                break
+                            await asyncio.sleep(0.05)
+                    except asyncio.CancelledError:
+                        mixer.stop_speech()
+                        raise
                     return True
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
 
@@ -4282,6 +4311,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Wait for current playback to finish (with timeout)
                 wait_start = time.monotonic()
                 while vc.is_playing():
+                    if is_current is not None and not is_current():
+                        return False
                     if time.monotonic() - wait_start > playback_timeout:
                         logger.warning("Timed out waiting for previous playback to finish")
                         vc.stop()
@@ -4314,10 +4345,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 source = discord.PCMVolumeTransformer(source, volume=1.0)
                 vc.play(source, after=_after)
                 try:
-                    await asyncio.wait_for(done.wait(), timeout=playback_timeout)
+                    if is_current is None:
+                        await asyncio.wait_for(done.wait(), timeout=playback_timeout)
+                    else:
+                        deadline = time.monotonic() + playback_timeout
+                        while not done.is_set():
+                            if not is_current():
+                                vc.stop()
+                                return False
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise asyncio.TimeoutError
+                            try:
+                                await asyncio.wait_for(done.wait(), timeout=min(.1, remaining))
+                            except asyncio.TimeoutError:
+                                continue
                 except asyncio.TimeoutError:
                     logger.warning("Voice playback timed out after %.1fs", playback_timeout)
                     vc.stop()
+                except asyncio.CancelledError:
+                    vc.stop()
+                    raise
                 return True
             finally:
                 if receiver:

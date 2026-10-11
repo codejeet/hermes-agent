@@ -253,6 +253,99 @@ These work in both Telegram and Discord (DMs and text channels):
 
 Voice mode setting is persisted across gateway restarts.
 
+### Fast voice director (optional)
+
+The voice director uses a fast, tool-free model for conversation and a full
+Hermes agent for real work. Greetings and simple replies do not start a heavy
+agent. Clear background speech is ignored; mic checks such as “testing, testing”
+get an immediate response.
+
+```yaml
+voice:
+  auto_tts: true
+  fast_ack:
+    enabled: true
+    provider: openai-codex
+    model: YOUR_FAST_MODEL_ID
+    reasoning_effort: low
+    ack_timeout_ms: 4000           # Tune against real router latency
+    summarize_final: true
+    summary_timeout_ms: 10000
+    spoken_summary_style: >-
+      Succinct, casual and conversational. Natural inflection, not theatrical
+      delivery. Usually one or two sentences. With ElevenLabs v4, use at most
+      one subtle audio tag when it helps; most replies need none.
+  job_model:
+    provider: openai-codex
+    model: YOUR_JOB_MODEL_ID
+    reasoning_effort: high
+
+discord:
+  voice_channel_inactivity_timeout_seconds: 0
+```
+
+Use exact model IDs available to your provider/account. These are language-model
+settings, not TTS voice names; configure the speaking voice separately under
+`tts`. Both fast requests and full voice jobs request `service_tier: priority`.
+Provider support and actual latency still depend on the selected model and account.
+
+- **Real work keeps the normal tools, memory, and approvals.** The original
+  transcript is authoritative. A router's suggested job description is hidden,
+  advisory turn context—not a replacement user request.
+- **You can keep talking during work.** Quick social replies can be spoken while
+  the job runs. Follow-up work, including independent requests, goes into a bounded
+  FIFO rather than interrupting the job or racing writes to the same session.
+  Direct replies are saved through the normal session writer when their turn drains.
+- **Full text stays in chat and history.** The fast model narrates a short spoken
+  version of the public final answer. It never receives private reasoning or
+  hidden thought streams. Streaming final TTS and the mixer's canned tool-start
+  acknowledgment are disabled for these turns to avoid duplicate speech; ambient
+  mixer audio can remain enabled.
+- **Failures fall back.** Malformed or late routing falls back to the normal agent
+  (queued when busy). Summary failure falls back to the public final text. The
+  routing deadline is separate from the narration deadline, each capped at 15 seconds.
+  A routing call can delay the heavy turn up to its configured deadline; tune this
+  using measured latency, not just the model's name.
+- **Voice-off and cancellation win.** `/voice off` disables this voice-specific
+  route. `/stop` and `/new` invalidate late speech; Discord also checks before
+  decoded audio starts and during playback. This does not change text-model settings.
+
+The director is opt-in and uses at most eight recent public conversation messages
+(6,000 characters) as context. Questions needing personal memory, live facts, tools,
+or substantial reasoning belong to the full agent, not the fast responder.
+
+Join a Discord voice channel with `/voice channel`; Hermes does not autojoin other
+rooms. Setting `discord.voice_channel_inactivity_timeout_seconds: 0` keeps the
+joined channel open until you leave/disconnect. The older `voice_timeout_seconds`
+key is not this setting. Listening remains active during agent work. To keep
+receiving speech during replies too, enable the continuous mixer (without an
+ambient bed or a second canned acknowledgment):
+
+```yaml
+discord:
+  voice_fx:
+    enabled: true
+    ambient_enabled: false
+    ack_enabled: false
+tts:
+  provider: elevenlabs
+  elevenlabs:
+    model_id: eleven_v4_turbo
+    # Keep your existing voice_id.
+```
+
+Spoken clips are serialized per guild so a quick reply and a completed job do
+not talk over each other. The legacy non-mixer playback path temporarily pauses
+input to prevent audio echo. ElevenLabs v4 supports inline audio tags such as
+`[curious]`; these survive Hermes's text cleanup. The configured
+`spoken_summary_style` applies to both fast replies and final narration. Use
+subtle tags sparingly, not sound effects or theatrical stage directions.
+
+Gateway logs include `Voice director attempted`, `routed`, `timeout`, and narration
+receipts with the model and latency. Check these and actual audio before assuming
+the fast layer is active. This feature does not restore older experimental
+`parallel_inbound`, output-ranking, or filtered-thought speech settings.
+
 ### Platform Delivery
 
 | Platform | Format | Notes |

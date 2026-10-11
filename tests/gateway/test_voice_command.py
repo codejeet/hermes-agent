@@ -1209,7 +1209,7 @@ class TestPlayInVoiceChannelUsesRunningLoop:
         """The method source code calls get_running_loop, not get_event_loop."""
         import inspect
         from plugins.platforms.discord.adapter import DiscordAdapter
-        source = inspect.getsource(DiscordAdapter.play_in_voice_channel)
+        source = inspect.getsource(DiscordAdapter._play_in_voice_channel_unlocked)
         assert "get_running_loop" in source, \
             "play_in_voice_channel should use asyncio.get_running_loop()"
         assert "get_event_loop" not in source, \
@@ -1340,7 +1340,7 @@ class TestPlaybackTimeout:
         """The method uses asyncio.wait_for with timeout."""
         import inspect
         from plugins.platforms.discord.adapter import DiscordAdapter
-        source = inspect.getsource(DiscordAdapter.play_in_voice_channel)
+        source = inspect.getsource(DiscordAdapter._play_in_voice_channel_unlocked)
         assert "wait_for" in source, \
             "play_in_voice_channel must use asyncio.wait_for for timeout"
         assert "_playback_timeout_for_audio" in source, \

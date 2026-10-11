@@ -2835,6 +2835,35 @@ class TestCodexAdapterReasoningTranslation:
 
 
 
+    @pytest.mark.parametrize("host", [
+        "https://chatgpt.com/backend-api/codex",
+        "https://api.openai.com/v1",
+    ])
+    def test_priority_tier_forwarded_to_openai_responses(self, host):
+        adapter, captured = self._build_adapter()
+        adapter._client.base_url = host
+        adapter.create(
+            model="gpt-6-luna",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"service_tier": "priority", "reasoning": {"effort": "low"}},
+        )
+        assert captured.get("service_tier") == "priority"
+        assert captured["reasoning"]["effort"] == "low"
+
+    @pytest.mark.parametrize("host", [
+        "https://api.x.ai/v1",
+        "https://api.githubcopilot.com",
+        "https://example.invalid/v1",
+    ])
+    def test_priority_tier_not_leaked_to_other_responses_backends(self, host):
+        adapter, captured = self._build_adapter()
+        adapter._client.base_url = host
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"service_tier": "priority"},
+        )
+        assert "service_tier" not in captured
+
     def test_reasoning_effort_low_passed_through(self):
         adapter, captured = self._build_adapter()
         adapter.create(

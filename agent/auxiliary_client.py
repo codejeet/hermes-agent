@@ -1260,6 +1260,15 @@ class _CodexCompletionsAdapter:
         # same behavior as the main agent's Codex transport.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
+            # Voice directors and other auxiliary callers use extra_body for
+            # priority processing. Preserve it on first-party OpenAI Responses
+            # (including Codex OAuth); never leak it to xAI/Copilot backends.
+            service_tier = extra_body.get("service_tier")
+            if service_tier in ("auto", "default", "flex", "priority") and (
+                base_url_host_matches(_host_for_input, "chatgpt.com")
+                or base_url_host_matches(_host_for_input, "api.openai.com")
+            ):
+                resp_kwargs["service_tier"] = service_tier
             reasoning_cfg = extra_body.get("reasoning")
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
